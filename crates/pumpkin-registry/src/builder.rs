@@ -103,10 +103,16 @@ mod tests {
 
         assert!(registry.get(&entry_name).is_none());
 
-        registry
-            .replace_entries([(entry_name.clone(), Entry(1))])
-            .unwrap();
+        assert!(
+            registry
+                .replace_entries([(entry_name.clone(), Entry(1))])
+                .is_ok()
+        );
 
-        assert_eq!(*registry.get(&entry_name).unwrap(), Entry(1));
+        assert!(
+            registry
+                .get(&entry_name)
+                .is_some_and(|entry| *entry == Entry(1))
+        );
     }
 }

@@ -7,6 +7,12 @@ pub struct DatapackRegistries {
     pub damage_types: Arc<ReloadableRegistry<DamageTypeFile>>,
 }
 
+impl Default for DatapackRegistries {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DatapackRegistries {
     #[must_use]
     pub fn new() -> Self {
@@ -16,7 +22,7 @@ impl DatapackRegistries {
             )),
         }
     }
-    pub async fn reload_damage_types<I>(&self, entries: I) -> Result<(), BootstrapError>
+    pub fn reload_damage_types<I>(&self, entries: I) -> Result<(), BootstrapError>
     where
         I: IntoIterator<Item = (Identifier, DamageTypeFile)>,
     {
@@ -24,7 +30,7 @@ impl DatapackRegistries {
 
         entries.sort_unstable_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
 
-        self.damage_types.replace_entries(entries).await
+        self.damage_types.replace_entries(entries)
     }
 }
 
@@ -32,7 +38,7 @@ impl DatapackRegistries {
 mod tests {
     use super::DatapackRegistries;
     use crate::damage_type::DamageTypeFile;
-    use pumpkin_registry::{AsyncTypedRegistry, Registry, error::BootstrapError};
+    use pumpkin_registry::{Registry, TypedRegistry, error::BootstrapError};
     use pumpkin_util::identifier::Identifier;
 
     fn damage_type(id: Identifier, message_id: &str) -> DamageTypeFile {
@@ -42,29 +48,27 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reload_damage_types_sorts_and_populates_registry() -> Result<(), BootstrapError> {
+    #[test]
+    fn reload_damage_types_sorts_and_populates_registry() -> Result<(), BootstrapError> {
         let registries = DatapackRegistries::new();
         let alpha = Identifier::parse_static("test:alpha");
         let zeta = Identifier::parse_static("test:zeta");
 
-        registries
-            .reload_damage_types([
-                (zeta.clone(), damage_type(zeta.clone(), "zeta")),
-                (alpha.clone(), damage_type(alpha.clone(), "alpha")),
-            ])
-            .await?;
+        registries.reload_damage_types([
+            (zeta.clone(), damage_type(zeta.clone(), "zeta")),
+            (alpha.clone(), damage_type(alpha.clone(), "alpha")),
+        ])?;
 
         assert_eq!(
-            Registry::get_id_async(registries.damage_types.as_ref(), &alpha).await,
+            Registry::get_id(registries.damage_types.as_ref(), &alpha),
             Some(0),
         );
         assert_eq!(
-            Registry::get_id_async(registries.damage_types.as_ref(), &zeta).await,
+            Registry::get_id(registries.damage_types.as_ref(), &zeta),
             Some(1),
         );
 
-        let alpha_entry = AsyncTypedRegistry::get(registries.damage_types.as_ref(), &alpha).await;
+        let alpha_entry = TypedRegistry::get(registries.damage_types.as_ref(), &alpha);
         assert_eq!(
             alpha_entry.as_deref().map(DamageTypeFile::message_id),
             Some("alpha"),
