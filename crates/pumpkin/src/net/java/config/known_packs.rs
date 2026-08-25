@@ -11,7 +11,13 @@ impl JavaClient {
         // let mut tags_to_send = Vec::new();
         let version = self.version.load();
         if version >= JavaMinecraftVersion::V_1_20_2 {
-            self.send_packet_now(&CFeatureFlags::new(&["minecraft:vanilla".to_string()]))
+            let feature_flags = server
+                .datapack_manager
+                .repository
+                .read()
+                .await
+                .enabled_feature_flags();
+            self.send_packet_now(&CFeatureFlags::new(&feature_flags))
                 .await;
             let registry = Registry::get_synced(version);
             let mut sent_dimension_type = false;
