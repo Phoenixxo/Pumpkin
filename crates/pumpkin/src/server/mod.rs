@@ -444,7 +444,6 @@ impl Server {
             level_info,
             datapack_manager,
         };
-
         let server = Arc::new(server);
         // Fetch / generate keys in background tasks to avoid blocking startup
         let server_clone = server.clone();

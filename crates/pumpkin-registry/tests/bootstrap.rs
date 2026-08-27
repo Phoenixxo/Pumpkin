@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use pumpkin_registry::{
-    BOOTSTRAP, RegistryBuilder, TypedRegistry,
+    BOOTSTRAP, RegistryBuilder, RegistryConfig, TypedRegistry,
     bootstrap::{BootstrapManager, RegistryEntry},
     bootstrap_provider,
 };
@@ -11,6 +11,7 @@ use pumpkin_util::identifier::Identifier;
 struct Block(usize);
 
 static BLOCK_REGISTRY: Identifier = Identifier::parse_static("test:blocks");
+static OVERWRITE_REGISTRY: Identifier = Identifier::parse_static("test:overwrite");
 
 bootstrap_provider! {
     PROVIDER_ONE: Block => "test:blocks" => {
@@ -29,6 +30,18 @@ bootstrap_provider! {
     PROVIDER_THREE: Block => "test:blocks",
     || {
         vec![RegistryEntry::new(Identifier::parse_static("test:four"), Block(4))]
+    }
+}
+
+bootstrap_provider! {
+    OVERWRITE_PROVIDER_ONE: Block => "test:overwrite" => {
+        "test:value" => Block(1),
+    }
+}
+
+bootstrap_provider! {
+    OVERWRITE_PROVIDER_TWO: Block => "test:overwrite" => {
+        "test:value" => Block(2),
     }
 }
 
@@ -77,7 +90,7 @@ fn populates_all_linker_section_providers() {
 #[test]
 fn replaces_reloadable_registry_entries() {
     let _ = BOOTSTRAP.set(BootstrapManager::new());
-    let registry = RegistryBuilder::<Block>::reloadable(&BLOCK_REGISTRY).unwrap();
+    let registry = RegistryBuilder::<Block>::reloadable(&BLOCK_REGISTRY, &[], &[]).unwrap();
 
     registry
         .replace_entries([
@@ -95,7 +108,7 @@ fn replaces_reloadable_registry_entries() {
 #[test]
 fn failed_replacement_preserves_existing_entries() {
     let _ = BOOTSTRAP.set(BootstrapManager::new());
-    let registry = RegistryBuilder::<Block>::reloadable(&BLOCK_REGISTRY).unwrap();
+    let registry = RegistryBuilder::<Block>::reloadable(&BLOCK_REGISTRY, &[], &[]).unwrap();
     let duplicate = Identifier::parse_static("test:duplicate");
 
     let result = registry.replace_entries([(duplicate.clone(), Block(10)), (duplicate, Block(20))]);
@@ -103,4 +116,28 @@ fn failed_replacement_preserves_existing_entries() {
     assert!(result.is_err());
     let original = Identifier::parse_static("test:one");
     assert_eq!(*registry.get(&original).unwrap(), Block(1));
+}
+
+#[test]
+fn duplicate_entries_are_rejected_by_default() {
+    let manager = BootstrapManager::new();
+
+    assert!(manager.populate::<Block>(&OVERWRITE_REGISTRY).is_err());
+}
+
+#[test]
+fn duplicate_entries_can_be_overwritten() {
+    let manager = BootstrapManager::new();
+    let config = RegistryConfig {
+        allow_overwrites: true,
+    };
+
+    let (entries, mapping) = manager
+        .populate_with_config::<Block>(&OVERWRITE_REGISTRY, config)
+        .unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(mapping.len(), 1);
+    assert_eq!(mapping[&Identifier::parse_static("test:value")], 0);
+    assert!(matches!(entries[0], Block(1 | 2)));
 }

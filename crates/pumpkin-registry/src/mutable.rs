@@ -1,7 +1,6 @@
 use crate::{
-    BOOTSTRAP, ErasedRegistryIterator, Registry, TypedRegistry,
+    BOOTSTRAP, ErasedRegistryIterator, Registry, RegistryConfig, StaticRegistry, TypedRegistry,
     error::BootstrapError,
-    immutable::FrozenRegistry,
     value::{DynIterator, ErasedRegistryRef, SnapshotRef},
 };
 use arc_swap::ArcSwap;
@@ -14,19 +13,23 @@ use std::{
 };
 
 pub struct ReloadableRegistry<T: Send + Sync + 'static> {
-    inner: ArcSwap<FrozenRegistry<T>>,
+    inner: ArcSwap<StaticRegistry<T>>,
     name: Identifier,
+    config: RegistryConfig,
 }
 
 impl<T: Send + Sync + 'static> ReloadableRegistry<T> {
     pub(crate) fn new(
         name: Identifier,
+        static_entries: &'static [T],
         entries: Box<[T]>,
         mapping: FxHashMap<Identifier, usize>,
+        config: RegistryConfig,
     ) -> Self {
         Self {
-            inner: ArcSwap::from_pointee(FrozenRegistry::new(entries, mapping)),
+            inner: ArcSwap::from_pointee(StaticRegistry::new(static_entries, entries, mapping)),
             name,
+            config,
         }
     }
 
@@ -34,8 +37,8 @@ impl<T: Send + Sync + 'static> ReloadableRegistry<T> {
         let (entries, mapping) = BOOTSTRAP
             .get()
             .ok_or(BootstrapError::Uninitialized)
-            .and_then(|manager| manager.populate::<T>(&self.name))?;
-        let replacement = FrozenRegistry::new(entries.into_boxed_slice(), mapping);
+            .and_then(|manager| manager.populate_with_config::<T>(&self.name, self.config))?;
+        let replacement = StaticRegistry::new(&[], entries.into_boxed_slice(), mapping);
         self.inner.store(Arc::new(replacement));
         Ok(())
     }
@@ -62,7 +65,7 @@ impl<T: Send + Sync + 'static> ReloadableRegistry<T> {
             values.push(value);
         }
 
-        let replacement = FrozenRegistry::new(values.into_boxed_slice(), mapping);
+        let replacement = StaticRegistry::new(&[], values.into_boxed_slice(), mapping);
         self.inner.store(Arc::new(replacement));
         Ok(())
     }
@@ -108,19 +111,23 @@ struct SnapshotIterator<T>
 where
     T: Send + Sync + 'static,
 {
-    snapshot: Arc<FrozenRegistry<T>>,
-    next_id: usize,
+    snapshot: Arc<StaticRegistry<T>>,
+    entries: std::vec::IntoIter<(Identifier, usize)>,
 }
 
 impl<T> SnapshotIterator<T>
 where
     T: Send + Sync + 'static,
 {
-    const fn new(snapshot: Arc<FrozenRegistry<T>>) -> Self {
-        Self {
-            snapshot,
-            next_id: 0,
-        }
+    fn new(snapshot: Arc<StaticRegistry<T>>) -> Self {
+        let entries = snapshot
+            .mapping()
+            .iter()
+            .map(|(identifier, &id)| (identifier.clone(), id))
+            .collect::<Vec<_>>()
+            .into_iter();
+
+        Self { snapshot, entries }
     }
 }
 
@@ -131,10 +138,8 @@ where
     type Item = (Identifier, SnapshotRef<T>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let id = self.next_id;
-        let identifier = self.snapshot.identifier_by_id(id)?.clone();
+        let (identifier, id) = self.entries.next()?;
         let value = SnapshotRef::new(Arc::clone(&self.snapshot), id)?;
-        self.next_id += 1;
         Some((identifier, value))
     }
 }
@@ -143,8 +148,8 @@ struct ErasedSnapshotIterator<'a, T>
 where
     T: Send + Sync + 'static,
 {
-    snapshot: Arc<FrozenRegistry<T>>,
-    next_id: usize,
+    snapshot: Arc<StaticRegistry<T>>,
+    entries: std::vec::IntoIter<(Identifier, usize)>,
     marker: PhantomData<&'a ()>,
 }
 
@@ -152,10 +157,17 @@ impl<T> ErasedSnapshotIterator<'_, T>
 where
     T: Send + Sync + 'static,
 {
-    const fn new(snapshot: Arc<FrozenRegistry<T>>) -> Self {
+    fn new(snapshot: Arc<StaticRegistry<T>>) -> Self {
+        let entries = snapshot
+            .mapping()
+            .iter()
+            .map(|(identifier, &id)| (identifier.clone(), id))
+            .collect::<Vec<_>>()
+            .into_iter();
+
         Self {
             snapshot,
-            next_id: 0,
+            entries,
             marker: PhantomData,
         }
     }
@@ -168,10 +180,8 @@ where
     type Item = (Identifier, ErasedRegistryRef<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let id = self.next_id;
-        let identifier = self.snapshot.identifier_by_id(id)?.clone();
+        let (identifier, id) = self.entries.next()?;
         let value = ErasedRegistryRef::from_snapshot(Arc::clone(&self.snapshot), id)?;
-        self.next_id += 1;
         Some((identifier, value))
     }
 }

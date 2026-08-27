@@ -231,5 +231,6 @@ wit-bindgen = { version = "0.61", default-features = false, features = ["macros"
 
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 tracing-serde-structured = { version = "0.4", default-features = false }
+
 linkme = { version = "0.3", default-features = false }
 wasmparser = { version = "0.257", default-features = false }
