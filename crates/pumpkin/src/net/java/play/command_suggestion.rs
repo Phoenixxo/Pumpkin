@@ -19,10 +19,8 @@ impl JavaClient {
 
         let suggestions = server
             .command_dispatcher
-            .read()
-            .await
-            .suggest(cmd, &player.get_command_source(server).await)
-            .await;
+            .load()
+            .suggest(cmd, &player.get_command_source(server));
 
         let response = CCommandSuggestions::new(
             packet.id,
@@ -31,6 +29,6 @@ impl JavaClient {
             suggestions.into(),
         );
 
-        self.enqueue_packet(&response).await;
+        self.enqueue_client_packet(&response).await;
     }
 }

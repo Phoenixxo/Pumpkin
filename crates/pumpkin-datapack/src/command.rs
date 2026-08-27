@@ -16,21 +16,21 @@ pub struct DatapackCommand;
 
 impl DatapackCommand {
     /// Enable a datapack.
-    pub async fn enable(
-        manager: &DataPackManager,
-        name: &str,
-    ) -> Result<String, crate::DatapackError> {
-        manager.enable_pack(name).await?;
+    pub fn enable(manager: &DataPackManager, name: &str) -> Result<String, crate::DatapackError> {
+        manager.enable_pack(name)?;
         Ok(format!("Enabled datapack '{name}'"))
     }
 
     /// Enable a datapack at a specific position.
-    pub async fn enable_at_position(
+    pub fn enable_at_position(
         manager: &DataPackManager,
         name: &str,
         position: EnablePosition,
     ) -> Result<String, crate::DatapackError> {
-        let mut repo = manager.repository.write().await;
+        let mut repo = manager
+            .repository
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !repo.available_ids().contains(&name.to_string()) {
             return Err(crate::DatapackError::PackNotFound(name.to_string()));
         }
@@ -68,16 +68,13 @@ impl DatapackCommand {
             }
         }
         drop(repo);
-        manager.reload().await?;
+        manager.reload()?;
         Ok(format!("Enabled datapack '{name}'"))
     }
 
     /// Disable a datapack.
-    pub async fn disable(
-        manager: &DataPackManager,
-        name: &str,
-    ) -> Result<String, crate::DatapackError> {
-        manager.disable_pack(name).await?;
+    pub fn disable(manager: &DataPackManager, name: &str) -> Result<String, crate::DatapackError> {
+        manager.disable_pack(name)?;
         Ok(format!("Disabled datapack '{name}'"))
     }
 
@@ -112,11 +109,14 @@ impl DatapackCommand {
     }
 
     /// List available or enabled datapacks.
-    pub async fn list(
+    pub fn list(
         manager: &DataPackManager,
         mode: ListMode,
     ) -> Result<Vec<String>, crate::DatapackError> {
-        let repo = manager.repository.read().await;
+        let repo = manager
+            .repository
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let ids: Vec<String> = match mode {
             ListMode::Available => repo.available_ids(),

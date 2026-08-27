@@ -64,6 +64,16 @@ impl TagRegistry {
         self.resolved.len()
     }
 
+    /// Return the resolved tag IDs for one registry.
+    #[must_use]
+    pub fn tag_ids(&self, registry: &str) -> Vec<Identifier> {
+        self.resolved
+            .keys()
+            .filter(|(key, _)| key == registry)
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+
     /// Check if a specific element has a given tag in a registry.
     #[must_use]
     pub fn is_tagged(&self, registry: &str, element_id: &Identifier, tag_id: &Identifier) -> bool {

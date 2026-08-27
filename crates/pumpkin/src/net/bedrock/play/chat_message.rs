@@ -8,6 +8,10 @@ impl BedrockClient {
         player: &Arc<Player>,
         packet: SText<'_>,
     ) {
+        player.update_last_action_time();
+        if player.check_chat_spam(server) {
+            return;
+        }
         let gameprofile = &player.gameprofile;
 
         send_cancellable! {{
@@ -47,7 +51,7 @@ impl BedrockClient {
                         packet.filtered_message.map(std::borrow::Cow::into_owned),
                     );
 
-                    entity.world.load().broadcast_editioned(&je_packet, &be_packet).await;
+                    entity.world.load().broadcast_editioned(&je_packet, &be_packet);
                 }
             }
         }}

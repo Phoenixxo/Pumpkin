@@ -1,47 +1,48 @@
-use crate::command::args::ConsumedArgs;
-use crate::command::dispatcher::CommandError;
-use crate::command::tree::CommandTree;
-use crate::command::tree::builder::literal;
-use crate::command::{CommandExecutor, CommandResult, CommandSender};
+use pumpkin_data::translation;
+use pumpkin_util::PermissionLvl;
+use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
 use pumpkin_util::text::TextComponent;
 
-const NAMES: [&str; 1] = ["reload"];
-const DESCRIPTION: &str = "Reload datapacks and other server data.";
+use crate::command::argument_builder::{ArgumentBuilder, command};
+use crate::command::context::command_context::CommandContext;
+use crate::command::node::dispatcher::CommandDispatcher;
+use crate::command::node::{CommandExecutor, CommandExecutorResult};
+
+const DESCRIPTION: &str = "Reloads the server's datapacks.";
+const PERMISSION: &str = "minecraft:command.reload";
 
 struct ReloadExecutor;
 
 impl CommandExecutor for ReloadExecutor {
-    fn execute<'a>(
-        &'a self,
-        sender: &'a CommandSender,
-        server: &'a crate::server::Server,
-        _args: &'a ConsumedArgs<'a>,
-    ) -> CommandResult<'a> {
-        Box::pin(async move {
-            match server.reload_datapacks().await {
-                Ok(()) => {
-                    sender
-                        .send_message(TextComponent::text("§aDatapacks reloaded successfully."))
-                        .await;
-                    Ok(1)
-                }
-                Err(errors) => {
-                    for e in &errors {
-                        sender
-                            .send_message(TextComponent::text(format!("§c{e}")))
-                            .await;
-                    }
-                    Err(CommandError::CommandFailed(TextComponent::text(
-                        "§cDatapack reload completed with errors.",
-                    )))
-                }
-            }
-        })
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        // Vanilla announces the reload before doing it, so the feedback
+        // arrives even though reloading takes a moment.
+        context.source.send_feedback(
+            TextComponent::translate_cross(
+                translation::java::COMMANDS_RELOAD_SUCCESS,
+                translation::java::COMMANDS_RELOAD_SUCCESS,
+                [],
+            ),
+            true,
+        );
+
+        let server = context.server().clone();
+        server.reload_datapacks(&server);
+
+        Ok(0)
     }
 }
 
-pub fn init_command_tree() -> CommandTree {
-    CommandTree::new(NAMES, DESCRIPTION)
-        .execute(ReloadExecutor)
-        .then(literal("datapacks").execute(ReloadExecutor))
+pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistry) {
+    registry.register_permission_or_panic(Permission::new(
+        PERMISSION,
+        DESCRIPTION,
+        PermissionDefault::Op(PermissionLvl::Two),
+    ));
+
+    dispatcher.register(
+        command("reload", DESCRIPTION)
+            .requires(PERMISSION)
+            .executes(ReloadExecutor),
+    );
 }

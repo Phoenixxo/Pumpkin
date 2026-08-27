@@ -6,17 +6,17 @@ impl BedrockClient {
         if packet.container_id == 0 || packet.container_id == 0xff {
             self.inventory_opened.store(false, Ordering::Relaxed);
         }
-        player.on_handled_screen_closed().await;
+        player.on_handled_screen_closed();
 
-        self.enqueue_packet(&SContainerClose {
+        self.enqueue_client_packet(&SContainerClose {
             container_id: packet.container_id,
             container_type: packet.container_type,
-            server_initiated: false,
+            server_initiated_close: false,
         })
         .await;
 
         // Sync the cursor (make it empty) to Bedrock client
-        self.enqueue_packet(&CInventoryContent {
+        self.enqueue_client_packet(&CInventoryContent {
             container_id: VarUInt(59), // Cursor container ID
             slots: vec![NetworkItemStackDescriptor::default()],
             full_container_name: FullContainerName {
@@ -28,16 +28,17 @@ impl BedrockClient {
         .await;
 
         // Sync the inventory content to Bedrock client
-        self.enqueue_packet(&CInventoryContent {
+        let slots = player
+            .inventory()
+            .main_inventory
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(NetworkItemStackDescriptor::from)
+            .collect();
+        self.enqueue_client_packet(&CInventoryContent {
             container_id: VarUInt(0), // player inventory
-            slots: player
-                .inventory()
-                .main_inventory
-                .read()
-                .await
-                .iter()
-                .map(NetworkItemStackDescriptor::from)
-                .collect(),
+            slots,
             full_container_name: FullContainerName {
                 container_name: ContainerName::Inventory,
                 dynamic_id: None,

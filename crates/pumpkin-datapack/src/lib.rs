@@ -15,8 +15,7 @@ pub use pumpkin_util::identifier::Identifier;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock as SyncRwLock;
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 use function::manager::FunctionManager;
 use pack::repository::PackRepository;
@@ -56,7 +55,7 @@ pub enum DatapackError {
 pub struct DataPackManager {
     pub world_path: PathBuf,
     pub repository: RwLock<PackRepository>,
-    pub tags: SyncRwLock<TagRegistry>,
+    pub tags: RwLock<TagRegistry>,
     pub functions: RwLock<FunctionManager>,
     pub recipes: RwLock<Vec<pumpkin_protocol::codec::recipe::DynamicRecipe>>,
     pub loot_tables: RwLock<HashMap<Identifier, loot::LootTable>>,
@@ -75,7 +74,7 @@ impl DataPackManager {
         Self {
             world_path,
             repository: RwLock::new(repository),
-            tags: SyncRwLock::new(TagRegistry::new()),
+            tags: RwLock::new(TagRegistry::new()),
             functions: RwLock::new(FunctionManager::new()),
             recipes: RwLock::new(Vec::new()),
             loot_tables: RwLock::new(HashMap::new()),
@@ -88,10 +87,13 @@ impl DataPackManager {
     }
 
     /// Perform a full reload: open resources for selected packs and reload all data.
-    /// Caller must ensure `repository.write().await.reload()` has been called first.
-    pub async fn reload(&self) -> Result<(), DatapackError> {
+    /// Caller must ensure `repository.write().reload()` has been called first.
+    pub fn reload(&self) -> Result<(), DatapackError> {
         let packs = {
-            let repo = self.repository.write().await;
+            let repo = self
+                .repository
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             repo.open_all_selected()
         };
 
@@ -127,53 +129,142 @@ impl DataPackManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .replace_with(tags);
-        self.functions.write().await.replace_with(functions);
-        *self.recipes.write().await = recipes;
-        *self.loot_tables.write().await = loot_tables;
-        *self.predicates.write().await = predicates;
-        *self.item_modifiers.write().await = item_modifiers;
-        *self.advancements.write().await = advancements;
+        self.functions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace_with(functions);
+        *self
+            .recipes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = recipes;
+        *self
+            .loot_tables
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = loot_tables;
+        *self
+            .predicates
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = predicates;
+        *self
+            .item_modifiers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = item_modifiers;
+        *self
+            .advancements
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = advancements;
 
         // Set tick/load functions based on resolved tags
         self.functions
             .write()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set_special_functions(tick_funcs, load_funcs);
 
         Ok(())
     }
 
     /// Enable a pack by ID, then reload.
-    pub async fn enable_pack(&self, id: &str) -> Result<(), DatapackError> {
+    pub fn enable_pack(&self, id: &str) -> Result<(), DatapackError> {
         let changed = {
-            let mut repo = self.repository.write().await;
+            let mut repo = self
+                .repository
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             repo.add_pack(id)
         };
         if !changed {
             return Err(DatapackError::PackNotFound(id.to_string()));
         }
-        self.reload().await
+        self.reload()
     }
 
     /// Enable a pack at a specific position, then reload.
-    pub async fn enable_pack_at(&self, id: &str, index: usize) -> Result<(), DatapackError> {
+    pub fn enable_pack_at(&self, id: &str, index: usize) -> Result<(), DatapackError> {
         let changed = {
-            let mut repo = self.repository.write().await;
+            let mut repo = self
+                .repository
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             repo.add_pack_at(id, index)
         };
         if !changed {
             return Err(DatapackError::PackNotFound(id.to_string()));
         }
-        self.reload().await
+        self.reload()
     }
 
     /// Disable a pack by ID, then reload.
-    pub async fn disable_pack(&self, id: &str) -> Result<(), DatapackError> {
+    pub fn disable_pack(&self, id: &str) -> Result<(), DatapackError> {
         {
-            let mut repo = self.repository.write().await;
+            let mut repo = self
+                .repository
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             repo.remove_pack(id);
         };
-        self.reload().await
+        self.reload()
+    }
+
+    /// Return all loaded function and function-tag names for command suggestions.
+    #[must_use]
+    pub fn get_function_names(&self) -> Vec<String> {
+        let functions = self
+            .functions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tags = self
+            .tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut names = functions
+            .functions
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        names.extend(
+            tags.tag_ids("function")
+                .into_iter()
+                .map(|id| format!("#{id}")),
+        );
+        names.sort();
+        names
+    }
+
+    /// Resolve a function or function tag into executable command lines.
+    pub fn get_function_commands(&self, name: &str) -> Result<Vec<String>, DatapackError> {
+        let function_ids = if let Some(tag_name) = name.strip_prefix('#') {
+            let tag_id = Identifier::parse(tag_name)?;
+            self.tags
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_tag_values("function", &tag_id)
+                .map(<[_]>::to_vec)
+                .ok_or_else(|| DatapackError::Function(format!("Unknown function tag: {name}")))?
+        } else {
+            vec![Identifier::parse(name)?]
+        };
+
+        let functions = self
+            .functions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut commands = Vec::new();
+        for id in function_ids {
+            let Some(function) = functions.get(&id) else {
+                return Err(DatapackError::Function(format!("Unknown function: {id}")));
+            };
+            match function {
+                function::parser::MCFunction::PlainText {
+                    commands: function_commands,
+                } => commands.extend(function_commands.iter().cloned()),
+                function::parser::MCFunction::Macro { .. } => {
+                    return Err(DatapackError::Function(format!(
+                        "Function {id} requires macro arguments"
+                    )));
+                }
+            }
+        }
+        Ok(commands)
     }
 
     /// Check whether an element has a tag, consulting both static (compile-time)

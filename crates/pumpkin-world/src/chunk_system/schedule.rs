@@ -3,7 +3,7 @@ use super::chunk_holder::ChunkHolder;
 use super::chunk_state::{Chunk, StagedChunkEnum};
 use super::dag::{DAG, EdgeKey, Node, NodeKey};
 use super::generation_cache::Cache;
-use super::worker_logic::{RecvChunk, generation_work, io_read_work, io_write_work};
+use super::worker_logic::{RecvChunk, io_read_work, io_write_work};
 use super::{
     ChunkLevel, ChunkListener, ChunkLoading, ChunkPos, HashMapType, HashSetType, IOLock,
     LevelChannel,
@@ -69,12 +69,10 @@ pub struct GenerationSchedule {
     running_task_count: u16,
     max_in_flight: u16,
     queue_dirty: bool,
-    recv_chunk: crossfire::compat::MRx<(ChunkPos, RecvChunk)>,
-    io_read: crossfire::compat::MTx<Vec<ChunkPos>>,
-    io_write: crossfire::compat::Tx<Vec<(ChunkPos, Chunk)>>,
-    generate: crossfire::compat::MTx<(ChunkPos, Cache, StagedChunkEnum)>,
-    send_chunk: crossfire::compat::MTx<(ChunkPos, RecvChunk)>,
-    gen_pool: Option<Arc<rayon::ThreadPool>>,
+    recv_chunk: crossbeam::channel::Receiver<(ChunkPos, RecvChunk)>,
+    io_read: tokio::sync::mpsc::Sender<Vec<ChunkPos>>,
+    io_write: tokio::sync::mpsc::Sender<Vec<(ChunkPos, Chunk)>>,
+    send_chunk: crossbeam::channel::Sender<(ChunkPos, RecvChunk)>,
     listener: Arc<ChunkListener>,
     lighting_config: LightingEngineConfig,
     last_unload: std::time::Instant,
@@ -83,22 +81,17 @@ pub struct GenerationSchedule {
 impl GenerationSchedule {
     pub fn create(
         io_read_thread_count: usize,
-        gen_thread_count: usize,
         level: Arc<Level>,
         level_channel: Arc<LevelChannel>,
         listener: Arc<ChunkListener>,
         thread_tracker: &mut Vec<thread::JoinHandle<()>>,
-        gen_pool: Option<Arc<rayon::ThreadPool>>,
     ) {
-        let (send_chunk, recv_chunk) = crossfire::compat::mpmc::unbounded_blocking();
+        let (send_chunk, recv_chunk) = crossbeam::channel::unbounded();
 
-        let (send_read_io, recv_read_io) =
-            crossfire::compat::mpmc::bounded_tx_blocking_rx_async(io_read_thread_count + 5);
+        let (send_read_io, recv_read_io) = tokio::sync::mpsc::channel(io_read_thread_count + 5);
+        let recv_read_io = Arc::new(tokio::sync::Mutex::new(recv_read_io));
 
-        let (send_write_io, recv_write_io) =
-            crossfire::compat::spsc::bounded_tx_blocking_rx_async(500);
-
-        let (send_gen, recv_gen) = crossfire::compat::mpmc::bounded_blocking(gen_thread_count + 5);
+        let (send_write_io, recv_write_io) = tokio::sync::mpsc::channel(500);
 
         let io_lock = Arc::new((
             Mutex::new(HashMapType::default()),
@@ -120,28 +113,8 @@ impl GenerationSchedule {
             io_lock.clone(),
         ));
 
-        if gen_pool.is_none() {
-            for i in 0..gen_thread_count {
-                let recv_gen = recv_gen.clone();
-                let send_chunk = send_chunk.clone();
-                let level_clone = level.clone();
-
-                let handle = thread::Builder::new()
-                    .name(format!("Gen-{i}"))
-                    .spawn(move || {
-                        generation_work(&recv_gen, &send_chunk, &level_clone);
-                    })
-                    .expect("Failed to spawn Generation Thread");
-
-                thread_tracker.push(handle);
-            }
-        }
-
-        let max_in_flight = if gen_pool.is_some() {
-            (thread::available_parallelism().map_or(1, std::num::NonZero::get) * 4) as u16
-        } else {
-            gen_thread_count as u16
-        };
+        let max_in_flight =
+            (thread::available_parallelism().map_or(1, std::num::NonZero::get) * 4) as u16;
 
         let level_sched = level;
         let lighting_config = level_sched.lighting_config;
@@ -164,9 +137,7 @@ impl GenerationSchedule {
                     recv_chunk,
                     io_read: send_read_io,
                     io_write: send_write_io,
-                    generate: send_gen,
                     send_chunk,
-                    gen_pool,
                     listener,
                     chunk_map: HashMap::default(),
                     lighting_config,
@@ -268,9 +239,10 @@ impl GenerationSchedule {
 
         let mut ready = Vec::new();
         for (key, node) in &mut graph.nodes {
-            node.in_queue = false;
             if node.stage == StagedChunkEnum::None
                 || node.in_degree != 0
+                || node.in_queue
+                || node.in_flight
                 || waiting_for_chunks.contains(&key)
             {
                 continue;
@@ -445,8 +417,12 @@ impl GenerationSchedule {
                 })
             });
             if all_ready {
-                now_ready.push(node_key);
-                false
+                if node.in_degree == 0 {
+                    now_ready.push(node_key);
+                    false
+                } else {
+                    true
+                }
             } else {
                 true
             }
@@ -462,7 +438,6 @@ impl GenerationSchedule {
                     Self::calc_priority(&self.last_level, &self.last_high_priority, n.pos, n.stage);
                 self.queue.push(TaskHeapNode(priority, node_key));
             }
-            // If in_degree > 0, drop_node will re-queue when unblocked
         }
     }
 
@@ -508,10 +483,16 @@ impl GenerationSchedule {
                         }
                     }
                 }
-                if new_stage == StagedChunkEnum::None
-                    && holder.dependency_stage == StagedChunkEnum::None
-                {
-                    self.unload_chunks.insert(pos);
+                if new_stage == StagedChunkEnum::None {
+                    if holder.dependency_stage != StagedChunkEnum::None {
+                        let has_valid_task = self.graph.prune_edge_chain(&mut holder.occupied_by);
+                        if !has_valid_task {
+                            holder.dependency_stage = StagedChunkEnum::None;
+                        }
+                    }
+                    if holder.dependency_stage == StagedChunkEnum::None {
+                        self.unload_chunks.insert(pos);
+                    }
                 }
             } else {
                 if old_stage == StagedChunkEnum::None {
@@ -588,14 +569,120 @@ impl GenerationSchedule {
         true
     }
 
-    fn garbage_collect_dependencies(&mut self) {
-        // Garbage collect stranded dependencies
-        let mut stranded = Vec::new();
-        for (pos, holder) in &self.chunk_map {
-            if holder.target_stage == StagedChunkEnum::None
-                && holder.dependency_stage != StagedChunkEnum::None
+    fn recompute_dependency_stages(&mut self) {
+        let mut required: HashMapType<ChunkPos, StagedChunkEnum> = HashMapType::default();
+        let mut worklist: Vec<(ChunkPos, StagedChunkEnum)> = self
+            .chunk_map
+            .iter()
+            .filter(|(_, holder)| holder.target_stage != StagedChunkEnum::None)
+            .map(|(pos, holder)| (*pos, holder.target_stage))
+            .collect();
+
+        while let Some((pos, req)) = worklist.pop() {
+            let entry = required.entry(pos).or_insert(StagedChunkEnum::None);
+            if *entry >= req {
+                continue;
+            }
+            let start = *entry as u8 + 1;
+            *entry = req;
+
+            // Only expand the stages that were not already accounted for.
+            for i in start..=(req as u8) {
+                let stage = StagedChunkEnum::from(i);
+                let radius = stage.get_direct_radius();
+                if radius == 0 {
+                    continue;
+                }
+                let dependencies = stage.get_direct_dependencies();
+                for dx in -radius..=radius {
+                    for dz in -radius..=radius {
+                        if dx == 0 && dz == 0 {
+                            continue;
+                        }
+                        let neighbor = pos.add_raw(dx, dz);
+                        worklist.push((neighbor, dependencies[dx.abs().max(dz.abs()) as usize]));
+                    }
+                }
+            }
+        }
+
+        let mut nodes_to_drop = Vec::new();
+        let mut newly_unused = Vec::new();
+        for (pos, holder) in &mut self.chunk_map {
+            let new_dependency = required.get(pos).copied().unwrap_or(StagedChunkEnum::None);
+            if new_dependency >= holder.dependency_stage {
+                continue;
+            }
+            holder.dependency_stage = new_dependency;
+
+            let effective_target = holder.target_stage.max(new_dependency);
+            for i in (effective_target as usize + 1)..StagedChunkEnum::COUNT {
+                let task = holder.tasks[i];
+                if !task.is_null() {
+                    nodes_to_drop.push((*pos, i, task));
+                }
+            }
+            if effective_target == StagedChunkEnum::None {
+                newly_unused.push(*pos);
+            }
+        }
+        self.unload_chunks.extend(newly_unused);
+
+        for (pos, index, task) in nodes_to_drop {
+            if self
+                .graph
+                .nodes
+                .get(task)
+                .is_some_and(|node| node.in_flight)
             {
-                stranded.push(*pos);
+                continue;
+            }
+            self.waiting_for_chunks.remove(&task);
+            self.drop_node(task);
+            if let Some(holder) = self.chunk_map.get_mut(&pos) {
+                holder.tasks[index] = NodeKey::null();
+            }
+        }
+
+        self.purge_dropped_queue_entries();
+    }
+
+    /// Drop heap entries whose node has been cancelled. They are skipped when popped,
+    /// but a saturated queue is never drained, so without this the heap keeps every
+    /// cancelled task of every chunk the player has flown past and `sort_queue` gets
+    /// slower on each level change.
+    fn purge_dropped_queue_entries(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let graph = &self.graph;
+        let tasks: Vec<_> = self
+            .queue
+            .drain()
+            .filter(|task| graph.nodes.contains_key(task.1))
+            .collect();
+        self.queue = BinaryHeap::from(tasks);
+    }
+
+    fn garbage_collect_dependencies(&mut self) {
+        self.recompute_dependency_stages();
+
+        // Garbage collect stranded dependencies and empty holders
+        let mut stranded = Vec::new();
+        let mut empty_holders = Vec::new();
+
+        for (pos, holder) in &self.chunk_map {
+            if holder.target_stage == StagedChunkEnum::None {
+                if holder.dependency_stage != StagedChunkEnum::None {
+                    stranded.push(*pos);
+                } else if holder.current_stage == StagedChunkEnum::None
+                    && holder.chunk.is_none()
+                    && holder.occupied.is_null()
+                    && holder.tasks.iter().all(Key::is_null)
+                    && !holder.public
+                {
+                    empty_holders.push(*pos);
+                }
             }
         }
 
@@ -605,39 +692,17 @@ impl GenerationSchedule {
                 continue;
             }
 
-            let mut cur_edge = holder.occupied_by;
-            let mut prev_edge = EdgeKey::null();
-            let mut change_head = None;
-            let mut has_valid_task = false;
-
-            while !cur_edge.is_null() {
-                let edge = self.graph.edges.get(cur_edge).expect("edge exists");
-                if self.graph.nodes.contains_key(edge.to) {
-                    prev_edge = cur_edge;
-                    cur_edge = edge.next;
-                    has_valid_task = true;
-                } else {
-                    let next = edge.next;
-                    self.graph.edges.remove(cur_edge);
-                    cur_edge = next;
-                    if prev_edge.is_null() {
-                        change_head = Some(next);
-                    } else {
-                        self.graph
-                            .edges
-                            .get_mut(prev_edge)
-                            .expect("edge exists")
-                            .next = next;
-                    }
-                }
-            }
-            if let Some(next) = change_head {
-                holder.occupied_by = next;
-            }
-
+            let has_valid_task = self.graph.prune_edge_chain(&mut holder.occupied_by);
             if !has_valid_task {
                 holder.dependency_stage = StagedChunkEnum::None;
                 self.unload_chunks.insert(pos);
+            }
+        }
+
+        for pos in empty_holders {
+            if let Some(mut holder) = self.chunk_map.remove(&pos) {
+                self.graph.drop_edge_chain(holder.occupied_by);
+                holder.occupied_by = EdgeKey::null();
             }
         }
     }
@@ -671,6 +736,9 @@ impl GenerationSchedule {
                 }
             }
 
+            self.graph.drop_edge_chain(holder.occupied_by);
+            holder.occupied_by = EdgeKey::null();
+
             if holder.public {
                 self.public_chunk_map.remove(&pos);
                 holder.public = false;
@@ -702,7 +770,7 @@ impl GenerationSchedule {
             *data.entry(*pos).or_insert(0) += 1;
         }
         drop(data);
-        if let Err(e) = self.io_write.send(chunks) {
+        if let Err(e) = self.io_write.blocking_send(chunks) {
             error!(
                 "Failed to send chunks to io write thread during save (may have shut down): {:?}",
                 e
@@ -757,7 +825,7 @@ impl GenerationSchedule {
         }
         drop(data);
 
-        if let Err(e) = self.io_write.send(chunks) {
+        if let Err(e) = self.io_write.blocking_send(chunks) {
             error!("Failed to send chunks to io write thread: {:?}", e);
         }
     }
@@ -854,6 +922,15 @@ impl GenerationSchedule {
                         }
                     }
                 }
+                // If this chunk was only loaded for a dependency or cancelled
+                // and is no longer needed, clear dependency_stage and queue unload.
+                if holder.target_stage == StagedChunkEnum::None
+                    && holder.current_stage >= holder.dependency_stage
+                {
+                    holder.dependency_stage = StagedChunkEnum::None;
+                    self.unload_chunks.insert(pos);
+                }
+
                 holder.chunk = Some(chunk);
                 self.chunk_map.insert(pos, holder);
 
@@ -1087,13 +1164,15 @@ impl GenerationSchedule {
             }
 
             // 1. Get latest world state (player moves, etc)
-            self.resort_work(self.send_level.get());
+            if self.resort_work(self.send_level.get()) {
+                self.garbage_collect_dependencies();
+            }
 
             // Process unload queue periodically (every 1 second) to batch writes together
             // and act as a brief memory cache if a player walks back into the chunk.
-            if !self.unload_chunks.is_empty()
-                && self.last_unload.elapsed() >= std::time::Duration::from_secs(1)
-            {
+            // This must run even when the queue is empty: `garbage_collect_dependencies`
+            // is what puts stale dependency holders into the queue in the first place.
+            if self.last_unload.elapsed() >= std::time::Duration::from_secs(1) {
                 self.garbage_collect_dependencies();
                 self.process_unload_queue();
                 self.last_unload = std::time::Instant::now();
@@ -1130,6 +1209,7 @@ impl GenerationSchedule {
                     self.receive_chunk(pos, data);
                     if self.resort_work(self.send_level.get()) {
                         // If world state changed, we MUST re-sort before continuing
+                        self.garbage_collect_dependencies();
                         self.queue.push(task);
                         self.queue_dirty = true;
                         break 'out2;
@@ -1137,8 +1217,8 @@ impl GenerationSchedule {
                 }
 
                 if let Some(node) = self.graph.nodes.get_mut(task.1) {
+                    node.in_queue = false;
                     if node.in_degree != 0 {
-                        node.in_queue = false;
                         continue;
                     }
                     node.in_flight = true;
@@ -1177,6 +1257,12 @@ impl GenerationSchedule {
                         });
 
                     if node.stage > effective_target {
+                        if let Some(holder) = self.chunk_map.get_mut(&node.pos) {
+                            let task_slot = &mut holder.tasks[node.stage as usize];
+                            if *task_slot == task.1 {
+                                *task_slot = NodeKey::null();
+                            }
+                        }
                         self.waiting_for_chunks.remove(&task.1);
                         self.drop_node(task.1);
                         continue;
@@ -1199,7 +1285,10 @@ impl GenerationSchedule {
 
                         io_batch.push(node.pos);
                         if io_batch.len() >= 16
-                            && self.io_read.send(std::mem::take(&mut io_batch)).is_err()
+                            && self
+                                .io_read
+                                .blocking_send(std::mem::take(&mut io_batch))
+                                .is_err()
                         {
                             info!("IO read thread closed, saving remaining chunks...");
                             self.save_all_chunk(true);
@@ -1208,7 +1297,10 @@ impl GenerationSchedule {
                     } else {
                         // Send any pending IO batch before starting generation
                         if !io_batch.is_empty()
-                            && self.io_read.send(std::mem::take(&mut io_batch)).is_err()
+                            && self
+                                .io_read
+                                .blocking_send(std::mem::take(&mut io_batch))
+                                .is_err()
                         {
                             info!("IO read thread closed, saving remaining chunks...");
                             self.save_all_chunk(true);
@@ -1320,53 +1412,55 @@ impl GenerationSchedule {
                         }
 
                         self.running_task_count += 1;
-                        if let Some(pool) = &self.gen_pool {
-                            let pos = node.pos;
-                            let stage = node.stage;
-                            let send_chunk = self.send_chunk.clone();
-                            let level = level.clone();
-                            let settings =
-                                GenerationSettings::from_dimension(level.world_gen.dimension());
+                        let pos = node.pos;
+                        let stage = node.stage;
+                        let send_chunk = self.send_chunk.clone();
+                        let level = level.clone();
+                        let settings =
+                            GenerationSettings::from_dimension(level.world_gen.load().dimension());
 
-                            pool.spawn(move || {
-                                let result = crate::chunk_system::worker_logic::run_generation(
-                                    pos, cache, stage, &level, settings,
-                                );
-                                let _ = send_chunk.send((pos, result));
-                            });
-                        } else if self.generate.send((node.pos, cache, node.stage)).is_err() {
-                            self.running_task_count = self.running_task_count.saturating_sub(1);
-                            info!("Generation thread closed, saving remaining chunks...");
-                            self.save_all_chunk(true);
-                            break 'out2;
-                        }
+                        rayon::spawn(move || {
+                            let result = crate::chunk_system::worker_logic::run_generation(
+                                pos, cache, stage, &level, settings,
+                            );
+                            let _ = send_chunk.send((pos, result));
+                        });
                     }
                 }
             }
 
             // Flush any remaining IO batch
-            if !io_batch.is_empty() && self.io_read.send(std::mem::take(&mut io_batch)).is_err() {
+            if !io_batch.is_empty()
+                && self
+                    .io_read
+                    .blocking_send(std::mem::take(&mut io_batch))
+                    .is_err()
+            {
                 info!("IO read thread closed, saving remaining chunks...");
                 self.save_all_chunk(true);
             }
 
-            // 3. If queue is empty, wait for work or results
+            // 5. Wait for work or results
             if self.queue.is_empty() {
-                // If we have tasks in flight, wait for them with timeout
-                if self.running_task_count > 0 || !self.waiting_for_chunks.is_empty() {
+                if self.running_task_count > 0 {
                     match self.recv_chunk.recv_timeout(Duration::from_millis(5)) {
                         Ok((pos, data)) => {
                             self.receive_chunk(pos, data);
-                            self.resort_work(self.send_level.get());
+                            if self.resort_work(self.send_level.get()) {
+                                self.garbage_collect_dependencies();
+                            }
                         }
-                        Err(crossfire::compat::RecvTimeoutError::Timeout) => {
+                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                             // Periodically check LevelChannel for new requests
-                            self.resort_work(self.send_level.get());
+                            if self.resort_work(self.send_level.get()) {
+                                self.garbage_collect_dependencies();
+                            }
                         }
-                        Err(crossfire::compat::RecvTimeoutError::Disconnected) => break,
+                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
                     }
                 } else {
-                    // No tasks in flight, wait indefinitely for LevelChannel changes
+                    // No tasks in flight, check for any unblocked waiting tasks or stranded ready tasks
+                    self.check_waiting_tasks();
                     let restored = Self::restore_ready_tasks(
                         &mut self.graph,
                         &mut self.queue,
@@ -1375,13 +1469,42 @@ impl GenerationSchedule {
                         &self.last_high_priority,
                         &self.waiting_for_chunks,
                     );
-                    if restored > 0 {
-                        warn!("Restored {restored} stranded ready chunk tasks to generation queue");
+                    if restored > 0 || !self.queue.is_empty() {
+                        debug!(
+                            "Restored {restored} stranded ready chunk tasks to generation queue"
+                        );
+                        if self.queue_dirty {
+                            self.sort_queue();
+                            self.queue_dirty = false;
+                        }
                         continue;
                     }
                     debug_assert!(self.debug_check());
                     debug_assert_eq!(self.running_task_count, 0);
-                    self.resort_work(self.send_level.wait_and_get(level));
+                    if self.resort_work(self.send_level.wait_and_get(level)) {
+                        self.garbage_collect_dependencies();
+                    }
+                }
+                if self.queue_dirty {
+                    self.sort_queue();
+                    self.queue_dirty = false;
+                }
+            } else if self.running_task_count >= self.max_in_flight {
+                // Queue has tasks, but we are at maximum in-flight capacity.
+                // Wait for an in-flight worker to finish instead of busy-spinning.
+                match self.recv_chunk.recv_timeout(Duration::from_millis(5)) {
+                    Ok((pos, data)) => {
+                        self.receive_chunk(pos, data);
+                        if self.resort_work(self.send_level.get()) {
+                            self.garbage_collect_dependencies();
+                        }
+                    }
+                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                        if self.resort_work(self.send_level.get()) {
+                            self.garbage_collect_dependencies();
+                        }
+                    }
+                    Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
                 }
                 if self.queue_dirty {
                     self.sort_queue();
@@ -1436,6 +1559,9 @@ impl GenerationSchedule {
                     nodes_to_drop.push(holder.occupied);
                     holder.occupied = NodeKey::null();
                 }
+
+                self.graph.drop_edge_chain(holder.occupied_by);
+                holder.occupied_by = EdgeKey::null();
             }
 
             for node_key in nodes_to_drop {

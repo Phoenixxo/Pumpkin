@@ -1,9 +1,10 @@
 use crate::codec::item_stack_seralizer::ItemStackTemplateSerializer;
 use crate::codec::var_int::VarInt;
 use pumpkin_data::advancement_data::AdvancementProgressData;
-use pumpkin_data::packet::clientbound::PLAY_UPDATE_ADVANCEMENTS;
+use pumpkin_data::packet::clientbound::play::UPDATE_ADVANCEMENTS;
 use pumpkin_macros::java_packet;
 use pumpkin_util::identifier::Identifier;
+use pumpkin_util::text::TextComponent;
 
 use crate::ClientPacket;
 use crate::ser::NetworkWriteExt;
@@ -13,8 +14,8 @@ use pumpkin_util::version::JavaMinecraftVersion;
 /// Mirrors the relevant fields from `pumpkin_data::AdvancementDisplay`.
 #[derive(Clone)]
 pub struct DynAdvancementDisplay {
-    pub title: Vec<u8>,
-    pub description: Vec<u8>,
+    pub title: TextComponent,
+    pub description: TextComponent,
     pub icon: Option<pumpkin_data::item_stack::ItemStack>,
     pub frame_type: i32,
     pub show_toast: bool,
@@ -35,12 +36,13 @@ pub enum AdvancementEntry {
         id: Identifier,
         parent: Option<Identifier>,
         display: Option<DynAdvancementDisplay>,
+        criteria: Vec<String>,
         requirements: Vec<Vec<String>>,
         send_telemetry: bool,
     },
 }
 
-#[java_packet(PLAY_UPDATE_ADVANCEMENTS)]
+#[java_packet(UPDATE_ADVANCEMENTS)]
 #[allow(unused)]
 pub struct CUpdateAdvancements {
     pub reset: bool,
@@ -100,8 +102,8 @@ impl ClientPacket for CUpdateAdvancements {
                     let has_display = adv.display.is_some();
                     write.write_bool(has_display)?;
                     if let Some(display) = adv.display {
-                        write.write_slice(&display.get_title().encode())?;
-                        write.write_slice(&display.get_description().encode())?;
+                        write.write_component(&display.get_title(), version)?;
+                        write.write_component(&display.get_description(), version)?;
 
                         ItemStackTemplateSerializer::from(display.item_icon.clone())
                             .write_with_version(&mut write, version)?;
@@ -118,6 +120,13 @@ impl ClientPacket for CUpdateAdvancements {
                         write.write_f32_be(display.y)?;
                     }
 
+                    if *version < JavaMinecraftVersion::V_1_20_2 {
+                        write.write_var_int(&VarInt(adv.criteria.len() as i32))?;
+                        for criterion in adv.criteria {
+                            write.write_string(criterion)?;
+                        }
+                    }
+
                     write.write_var_int(&VarInt(adv.requirements.len() as i32))?;
                     for req in adv.requirements {
                         write.write_var_int(&VarInt(req.len() as i32))?;
@@ -126,12 +135,15 @@ impl ClientPacket for CUpdateAdvancements {
                         }
                     }
 
-                    write.write_bool(adv.send_telemetry)?;
+                    if *version >= JavaMinecraftVersion::V_1_20 {
+                        write.write_bool(adv.send_telemetry)?;
+                    }
                 }
                 AdvancementEntry::Dynamic {
                     id,
                     parent,
                     display,
+                    criteria,
                     requirements,
                     send_telemetry,
                 } => {
@@ -146,8 +158,8 @@ impl ClientPacket for CUpdateAdvancements {
                     let has_display = display.is_some();
                     write.write_bool(has_display)?;
                     if let Some(display) = display {
-                        write.write_slice(&display.title)?;
-                        write.write_slice(&display.description)?;
+                        write.write_component(&display.title, version)?;
+                        write.write_component(&display.description, version)?;
 
                         let stack = display.icon.clone().unwrap_or_else(|| {
                             pumpkin_data::item_stack::ItemStack::new(
@@ -170,6 +182,13 @@ impl ClientPacket for CUpdateAdvancements {
                         write.write_f32_be(display.y)?;
                     }
 
+                    if *version < JavaMinecraftVersion::V_1_20_2 {
+                        write.write_var_int(&VarInt(criteria.len() as i32))?;
+                        for criterion in criteria {
+                            write.write_string(criterion)?;
+                        }
+                    }
+
                     write.write_var_int(&VarInt(requirements.len() as i32))?;
                     for req in requirements {
                         write.write_var_int(&VarInt(req.len() as i32))?;
@@ -178,7 +197,9 @@ impl ClientPacket for CUpdateAdvancements {
                         }
                     }
 
-                    write.write_bool(*send_telemetry)?;
+                    if *version >= JavaMinecraftVersion::V_1_20 {
+                        write.write_bool(*send_telemetry)?;
+                    }
                 }
             }
         }
@@ -202,7 +223,9 @@ impl ClientPacket for CUpdateAdvancements {
             }
         }
 
-        write.write_bool(self.show_advancements)?;
+        if *version >= JavaMinecraftVersion::V_1_21_5 {
+            write.write_bool(self.show_advancements)?;
+        }
 
         Ok(())
     }
