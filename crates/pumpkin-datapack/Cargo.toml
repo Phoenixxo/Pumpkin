@@ -16,7 +16,6 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 futures.workspace = true
 rand.workspace = true
 zip = { version = "2.4", default-features = false, features = ["deflate"] }

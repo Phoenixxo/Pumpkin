@@ -156,6 +156,7 @@ pub enum EnablePosition {
 }
 
 /// Which list to show.
+#[derive(Clone, Copy)]
 pub enum ListMode {
     Available,
     Enabled,

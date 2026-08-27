@@ -695,15 +695,14 @@ impl Server {
 
     pub fn reload_datapacks(&self, server: &Arc<Self>) {
         let level = self.level_info.load();
-        {
-            let mut repository = self
-                .datapack_manager
-                .repository
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            repository.reload();
-            repository.configure(&level.data_packs.enabled, &level.data_packs.disabled, false);
-        }
+        let mut repository = self
+            .datapack_manager
+            .repository
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        repository.reload();
+        repository.configure(&level.data_packs.enabled, &level.data_packs.disabled, false);
+        drop(repository);
         drop(level);
 
         if !self.advanced_config.datapack.enabled {

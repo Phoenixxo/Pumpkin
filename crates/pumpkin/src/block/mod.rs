@@ -406,21 +406,28 @@ pub fn drop_loot(
     block: &Block,
     pos: &BlockPos,
     experience: bool,
-    params: LootContextParameters,
+    params: &LootContextParameters,
 ) {
     let loot_key = format!("minecraft:blocks/{}", block.name);
     let Some(dp_id) = pumpkin_datapack::Identifier::parse(&loot_key).ok() else {
         return;
     };
 
+    let static_loot = || {
+        block
+            .loot_table
+            .as_ref()
+            .map_or_else(Vec::new, |loot_table| loot_table.get_loot(params.clone()))
+    };
+
     // Datapack loot tables override static ones entirely (vanilla behaviour).
-    let items = if let Some(server) = world.server.upgrade() {
+    let items = world.server.upgrade().map_or_else(static_loot, |server| {
         let dp_tables = server
             .datapack_manager
             .loot_tables
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(dp_table) = dp_tables.get(&dp_id) {
+        dp_tables.get(&dp_id).map_or_else(static_loot, |dp_table| {
             let dp_predicates = server
                 .datapack_manager
                 .predicates
@@ -464,18 +471,8 @@ pub fn drop_loot(
                     Some(stack)
                 })
                 .collect()
-        } else {
-            block
-                .loot_table
-                .as_ref()
-                .map_or_else(Vec::new, |loot_table| loot_table.get_loot(params.clone()))
-        }
-    } else {
-        block
-            .loot_table
-            .as_ref()
-            .map_or_else(Vec::new, |loot_table| loot_table.get_loot(params.clone()))
-    };
+        })
+    });
 
     if !items.is_empty() {
         let mut event = crate::plugin::block::block_drop_item::BlockDropItemEvent {
