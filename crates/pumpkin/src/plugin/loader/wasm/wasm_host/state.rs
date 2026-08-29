@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Weak},
 };
 
@@ -8,11 +9,8 @@ use tokio::sync::Mutex;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
-    WasiHttpCtx,
-    p2::{
-        HttpError, HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
-        bindings::http::types::ErrorCode, default_send_request,
-    },
+    Error as HttpError, RequestOptions, Result as HttpResult, WasiBody, WasiHttpCtx,
+    WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
 };
 
 use crate::{
@@ -100,19 +98,14 @@ pub type ItemDisplayEntityResource = WasmResource<Arc<dyn EntityBase>>;
 pub type TextDisplayEntityResource = WasmResource<Arc<dyn EntityBase>>;
 pub type InteractionEntityResource = WasmResource<Arc<dyn EntityBase>>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ChunkBuffer {
     pub x: i32,
     pub z: i32,
     pub min_y: i32,
     pub height: u32,
-    pub proto_chunk: *mut pumpkin_world::ProtoChunk,
+    pub proto_chunk: Arc<std::sync::Mutex<pumpkin_world::ProtoChunk>>,
 }
-
-// SAFETY: `ChunkBuffer` encapsulates a raw pointer to a proto chunk that is uniquely accessed during custom world generation phases.
-unsafe impl Send for ChunkBuffer {}
-// SAFETY: `ChunkBuffer` encapsulates a raw pointer to a proto chunk that is uniquely accessed during custom world generation phases.
-unsafe impl Sync for ChunkBuffer {}
 
 pub type ChunkBufferResource = WasmResource<ChunkBuffer>;
 
@@ -329,6 +322,16 @@ impl PluginHostState {
         let resource = self
             .resource_table
             .push(ConsumedArgsResource { provider: owned })?;
+        Ok(wasmtime::component::Resource::new_own(resource.rep()))
+    }
+
+    pub fn add_owned_consumed_args<T>(
+        &mut self,
+        provider: OwnedConsumedArgs,
+    ) -> wasmtime::Result<wasmtime::component::Resource<T>> {
+        let resource = self
+            .resource_table
+            .push(ConsumedArgsResource { provider })?;
         Ok(wasmtime::component::Resource::new_own(resource.rep()))
     }
 
@@ -576,21 +579,24 @@ impl Default for PluginHttpHooks {
     }
 }
 
+type HttpIoFuture = Box<dyn Future<Output = HttpResult<()>> + Send>;
+type HttpSendFuture =
+    Box<dyn Future<Output = HttpResult<(hyper::Response<WasiBody>, HttpIoFuture)>> + Send>;
+
 impl WasiHttpHooks for PluginHttpHooks {
     fn send_request(
         &mut self,
-        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-    ) -> HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse> {
+        request: hyper::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        response_io: HttpIoFuture,
+    ) -> HttpSendFuture {
         if !self.allow_outbound {
-            return Err(HttpError::from(ErrorCode::HttpRequestDenied));
+            return Box::new(async { Err(HttpError::HttpRequestDenied) });
         }
 
-        Ok(default_send_request(request, config))
+        wasmtime_wasi_http::default_hooks().send_request(request, options, response_io)
     }
 }
-
-impl wasmtime_wasi_http::p3::WasiHttpHooks for PluginHttpHooks {}
 
 impl WasiView for PluginHostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -604,16 +610,6 @@ impl WasiView for PluginHostState {
 impl WasiHttpView for PluginHostState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
-            ctx: &mut self.wasi_http_ctx,
-            table: &mut self.resource_table,
-            hooks: &mut self.wasi_http_hooks,
-        }
-    }
-}
-
-impl wasmtime_wasi_http::p3::WasiHttpView for PluginHostState {
-    fn http(&mut self) -> wasmtime_wasi_http::p3::WasiHttpCtxView<'_> {
-        wasmtime_wasi_http::p3::WasiHttpCtxView {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
             hooks: &mut self.wasi_http_hooks,

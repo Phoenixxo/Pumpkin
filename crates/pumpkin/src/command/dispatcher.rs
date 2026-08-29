@@ -789,6 +789,22 @@ impl CommandDispatcher {
             self.permissions.remove(&key);
         }
     }
+
+    /// Removes every command registered by the given plugin source.
+    pub fn unregister_source(&mut self, source: &str) {
+        let commands: Vec<String> = self
+            .commands
+            .iter()
+            .filter_map(|(name, command)| match command {
+                Command::Tree(tree) if tree.source.as_deref() == Some(source) => Some(name.clone()),
+                Command::Tree(_) | Command::Alias(_) => None,
+            })
+            .collect();
+
+        for command in commands {
+            self.unregister(&command);
+        }
+    }
 }
 
 #[cfg(test)]

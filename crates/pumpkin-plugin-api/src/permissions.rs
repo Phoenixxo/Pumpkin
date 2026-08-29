@@ -39,9 +39,9 @@ pub const FS_READ_DATA: &str = "fs.read.data";
 
 /// Allows the plugin to write files within its own data folder (`plugins/data/<name>`).
 ///
-/// Note that even without `FS_READ_DATA`, this will allow the plugin to
-/// inspect (e.g. list) the contents of the directory. But it will block
-/// reading any file's contents.
+/// The current Wasmtime runtime cannot enforce write-only preopens, so plugins
+/// must request `FS_READ_DATA` together with this permission. Pumpkin rejects
+/// write-only access instead of silently granting file-content reads.
 pub const FS_WRITE_DATA: &str = "fs.write.data";
 
 /// Allows the plugin to read all environment variables.
