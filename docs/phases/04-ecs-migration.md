@@ -12,7 +12,7 @@ Entity identity must become independent of storage location before columns can m
 
 ### 4.1 Establish stable identity and a compatibility facade
 
-An internal generational `EntityKey` should resolve through a locator to `(world, region, batch, row, owner_generation)`. External UUIDs and protocol entity IDs stay stable when rows compact or cross regions. A compatibility facade can resolve existing `EntityBase` lookups through the owner; plugin and packet APIs should not retain row pointers across structural changes. Counters for stale lookups and generation failures reveal incorrect lifetimes.
+An internal generational `EntityKey` should resolve through a locator to `(world, region, batch, row, owner_generation)`. External UUIDs and protocol entity IDs stay stable when rows compact or cross regions. A compatibility facade can resolve existing `EntityBase` lookups through the owner. Plugin host calls use opaque handles with owner and generation checks; neither plugin nor packet APIs retain row pointers, table borrows, or mutable component references across structural changes or an await. Counters for stale lookups and generation failures reveal incorrect lifetimes.
 
 ### 4.2 Pilot hot SoA columns
 
@@ -20,7 +20,7 @@ The pilot stores positions, velocities, and hitboxes in sequential aligned array
 
 ### 4.3 Make systems explicit
 
-Movement, broad-phase collision, narrow-phase collision, combat, AI, and tracking each need declared read and write sets. Rayon `par_iter_mut` over disjoint batches can update independent columns or derive `MotionIntent` values from immutable collision halos. The owner resolves interactions between entities in a stable order, so two workers never mutate the same entity or opposite sides of a collision concurrently. If the selected ECS library schedules systems from component access, its scheduler should coordinate with Rayon rather than run a second unconstrained schedule over the same data.
+Movement, broad-phase collision, narrow-phase collision, combat, AI, and tracking each need declared read and write sets and an explicit plugin-entry classification. Rayon `par_iter_mut` over disjoint batches can update independent columns or derive `MotionIntent` values from immutable collision halos only for audited plugin-free systems. A system that can dispatch an event, invoke a plugin, or await a host operation runs from a managed owner task and releases ECS borrows before suspension. The owner resolves interactions between entities in a stable order, so two workers never mutate the same entity or opposite sides of a collision concurrently. If the selected ECS library schedules systems from component access, its scheduler should coordinate with Rayon rather than run a second unconstrained schedule over the same data.
 
 ### 4.4 Batch structural changes and transfers
 
@@ -37,6 +37,7 @@ The first family should have movement and collision behavior covered by determin
 3. Structural changes occur only after all parallel query borrows finish. Cross-entity results are sorted before owner commit.
 4. Read-only snapshots publish committed data only. A long-running AI or lighting result must match its source revision and owner generation before it can affect ECS state.
 5. Memory includes component capacity, sparse stores, compatibility facades, and retained snapshots; lower per-entity CPU is not enough if RSS becomes unstable.
+6. A plugin-capable ECS system begins in a managed domain task. No Rayon leaf enters a plugin, and no row, owner-state, Store, or resource-table borrow survives an await.
 
 ## Validation gate
 
@@ -46,6 +47,7 @@ The gate requires gameplay parity and stable ownership before treating lower cyc
 | --- | --- |
 | Gameplay parity | Movement, collision, damage, mounting, spawn/despawn, and plugin-visible state must match the declared baseline trace for each migrated family. |
 | Ownership safety | Tests and debug assertions must detect any dual writer, stale-row mutation, or accepted old-generation command under transfer and compaction stress. |
+| Plugin integration | Mixed v0.1/v0.2 callbacks and host operations resolve opaque entity handles after suspension, preserve legacy causal admission, and reject stale generations without retaining an ECS borrow. |
 | Determinism | The same ordered inputs must yield the same authoritative state with one or many Rayon workers, apart from explicitly documented nondeterministic observations. |
 | Performance | Profile cycles per entity tick, LLC misses, allocation rate, lock and atomic contention, rows moved, and p99 region tick against [phase 00](00-baseline-and-benchmarks.md). Compare both dense and sparse worlds. |
 | Lifecycle | Repeated spawn/despawn, teleport, dimension change, vehicle/passenger transitions, save/load, and region migration must not lose or duplicate entities. |

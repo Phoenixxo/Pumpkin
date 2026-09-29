@@ -4,7 +4,7 @@
 
 ## Objective and scope
 
-Pumpkin already has useful foundations for a server that presents one continuous world: Tokio handles asynchronous I/O, and parts of world ticking run on Rayon. This design gives authoritative world mutation to spatial owners, moves finite CPU work onto bounded worker pools, and treats plugin execution and network delivery as explicit scheduling boundaries. Players can move through the world without a proxy handoff or reconnect.
+Pumpkin already has useful foundations for a server that presents one continuous world: Tokio handles asynchronous I/O, and parts of world ticking run on Rayon. The proposal gives authoritative world mutation to spatial owners and starts plugin-capable work as managed stackless tasks before it can await a plugin. Rayon remains available for audited plugin-free CPU work. Plugin execution and network delivery have explicit admission boundaries. Players can move through the world without a proxy handoff or reconnect.
 
 The capacity goal is **more than 10,000 concurrent players and tens of thousands of active entities**. It is a workload to validate, not a property inferred from Rust, idle memory use, or startup time. A credible result will identify the machine and NIC, Java and Bedrock mix, view and simulation distances, movement pattern, active chunks, entity types, and plugin workload. In particular, a crowd in which every player can see every other player creates network work that no choice of world scheduler can remove.
 
@@ -20,7 +20,7 @@ The upstream [README](../../README.md) calls Bedrock Edition work in progress. T
 
 ## Current scaffold and proposed extension
 
-The scheduler crate's Global admission and domain vocabulary provide a starting point for ownership. World, Region, and Entity scheduling still need implementations and application integration. The WASM host remains at v0.1. This blueprint first makes admission and plugin calls explicit at the existing boundary, then introduces region ownership and an asynchronous plugin contract. During migration, a manager-wide causal admission gate could preserve event ordering across plugin calls; it would carry a throughput cost and is not present upstream. The [plugin pipeline](plugin-pipeline.md) describes that tradeoff.
+The scheduler crate's Global admission and domain vocabulary provide a starting point, but managed stackless task execution and application integration still need proof and implementation. The inspected upstream host remains at v0.1. A separate [fork proposal specifies `pumpkin:plugin@0.2.0` as a physically async WIT package](https://github.com/Phoenixxo/Pumpkin/blob/95fecc1b5969aa59dbb141f4c1090635f65ccd7e/crates/pumpkin-plugin-wit/v0.2/README.md); it does not supply the v0.2 host or scheduler integration. The proposed rollout first keeps v0.1 in a permanent, fair, graph-wide compatibility lane and brings plugin-capable roots into a stackless Global domain. The v0.2 Store path can then suspend and reenter without holding its caller's worker. World, Region, and Entity ownership follow in later stages without changing either plugin ABI. The [plugin pipeline](plugin-pipeline.md) defines these separate boundaries.
 
 Folia is a useful comparator: it already merges and splits independently ticking regions. The proposal here additionally divides independent subsystem work *inside* a busy ownership domain, uses versioned snapshots for off-thread computation, and makes replication cost explicit. It cannot parallelize a genuinely serial gameplay dependency merely by making cells smaller. See [PaperMC's region logic](https://docs.papermc.io/folia/reference/region-logic/) and [overview](https://docs.papermc.io/folia/reference/overview/).
 
@@ -31,16 +31,21 @@ flowchart LR
     J[Java TCP on Tokio] --> D[Frame, decrypt, decode]
     B[Bedrock WebRTC on Tokio] --> D
     D --> I[Bounded ingress]
-    I --> O[Published spatial owner directory]
-    O --> R[Region actor mailboxes]
+    I --> T[Managed stackless domain task]
+    T --> G[Global domain first]
+    T --> O[Owner directory after migration]
+    O --> R[Region owner mailboxes]
     R --> E[Owner-local ECS and chunks]
     R --> S[Versioned snapshots and border halos]
-    S --> C[Bounded Rayon CPU pools]
+    S --> C[Audited plugin-free Rayon jobs]
     C --> R
-    R --> P[Decision or observation event]
-    P --> W[WASM Store owners]
+    G --> P[Owned plugin invocation]
+    R --> P
+    P --> A[Pumpkin ABI adapter]
+    A --> W[Versioned WASM Store lanes]
     W --> H[Async host dispatcher]
-    H --> R
+    H --> G
+    H --> O
     R --> X[Committed state deltas]
     X --> F[Interest index and wire cohorts]
     F --> Q[Bounded per-client egress]
@@ -48,7 +53,7 @@ flowchart LR
     Q --> B
 ```
 
-Tokio tasks own sockets and coordinate asynchronous work. A region actor represents exclusive authority over a part of the world; it does not require a dedicated operating-system thread. Rayon executes finite CPU jobs from immutable inputs and returns results for validation by the owner. Its workers never wait synchronously for a plugin or a socket. When a plugin decision is outstanding, the affected transaction waits while the owner may continue unrelated work. The [spatial design](spatial-ownership-and-ecs.md) describes the ownership and handoff rules, and the [plugin design](plugin-pipeline.md) defines the event boundary.
+Tokio tasks own sockets and asynchronous coordination. Pumpkin's adapter carries an opaque call chain from the plugin runtime and an execution domain from the scheduler; those generic crates do not depend on one another. A region actor represents exclusive authority over a part of the world, not a dedicated operating-system thread. Its plugin-capable root can return `Pending` while an owned invocation waits, releasing the scheduler worker. Rayon executes finite, plugin-free CPU jobs from immutable inputs and returns results for validation by the owner. The [spatial design](spatial-ownership-and-ecs.md) describes ownership and handoff; the [plugin design](plugin-pipeline.md) describes both ABI lanes and host dispatch.
 
 ## Consistency contract
 
@@ -68,7 +73,7 @@ The architecture therefore targets isolation of unrelated regions and bounded co
 
 ## Decisions that shape the implementation
 
-Authoritative mutation belongs to one owner at a time. Commands carry an owner generation so a transfer can reject work addressed to the previous owner. Distant owners can tick independently; global changes arrive as timestamped messages rather than forcing every region through a common barrier. CPU jobs consume immutable snapshots, and the owner checks their source versions before applying a result. The scheduler reserves capacity for simulation when generation, lighting, or other background jobs accumulate.
+Authoritative mutation belongs to one owner at a time. Commands carry an owner generation so a transfer can reject work addressed to the previous owner. Distant owners can tick independently after the Region stage; global changes arrive as timestamped messages rather than forcing every region through a common barrier. CPU jobs consume immutable snapshots, cannot enter plugins from unmanaged Rayon work, and return results whose source versions the owner checks before applying. The scheduler reserves capacity for simulation when generation, lighting, or other background jobs accumulate.
 
 Network work can be shared while recipients have the same protocol representation. Each connection still owns its framing choices, cipher state, and socket, so sharing ends at the point where their wire bytes diverge. Plugin decisions preserve cancellation semantics with a bounded wait for the affected transaction and a documented failure policy. The 10,000-player target is accepted only when repeatable tests show its latency, correctness, memory, and bandwidth behavior under the named workload.
 

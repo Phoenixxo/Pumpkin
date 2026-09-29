@@ -6,7 +6,7 @@ This document develops an ownership model for simulation and an entity layout th
 
 Pumpkin already uses Rayon. A dedicated [server ticker](../../crates/pumpkin/src/server/ticker.rs) invokes `Server::tick`; [world ticking](../../crates/pumpkin/src/server/mod.rs) distributes worlds, and [each world tick](../../crates/pumpkin/src/world/mod.rs) distributes player and entity work. The phases then rejoin before the server tick completes, so the slowest phase still determines its duration. Players and entities currently live in `ArcSwap<Vec<Arc<...>>>` collections. Frequently read entity fields are spread across trait objects, atomics, and locks, and collision work checks a tick-local player cache for each entity. The next concurrency boundary should address both the joined scheduling model and the layout of the data it schedules.
 
-The proposed rule is that **each active spatial cell and entity has one mutable owner at a time**. A region groups cells that need same-tick interaction and acts as their logical owner. The smallest connected set of cells whose shared operations require that ordering is an *interaction island*. A region's mailbox orders incoming work, while its simulation step may run on any available Rayon worker. Adjacent regions read immutable border views and send mutations to the appropriate owner. Tokio remains responsible for network I/O, deadlines, and actor coordination; bounded Rayon work performs CPU simulation. This division gives ECS batches a clear writer and removes the need for per-field atomics along much of the hot path.
+The proposed rule is that **each active spatial cell and entity has one mutable owner at a time**. A region groups cells that need same-tick interaction and acts as their logical owner. The smallest connected set of cells whose shared operations require that ordering is an *interaction island*. Its plugin-capable work runs as a managed stackless domain task, building on the Global-domain integration in [phase 02](../phases/02-plugin-execution.md). That task can await a plugin or another owner without occupying its scheduler worker. Adjacent regions read immutable border views and send mutations to the appropriate owner. Tokio remains responsible for network I/O and asynchronous coordination; Rayon runs bounded CPU leaves whose call graphs have been audited to exclude plugin entry. This division gives ECS batches a clear writer and removes the need for per-field atomics along much of the hot path.
 
 [Folia's region logic](https://docs.papermc.io/folia/reference/region-logic/) is a useful comparison because it already merges nearby regions and splits independent ones. For Pumpkin, the proposed design also defines how subsystem jobs consume versioned snapshots, how plugins await decisions, and how replication observes committed changes. These boundaries matter when work leaves the owner: parallel execution is safe only if its inputs and commit rules are explicit. Tightly coupled gameplay operations will still have a serial portion.
 
@@ -14,12 +14,12 @@ The proposed rule is that **each active spatial cell and entity has one mutable 
 flowchart LR
     N[Tokio ingress] --> D[Published owner directory]
     D --> A[Bounded region mailboxes]
-    A --> R[Exclusive region tick on Rayon]
+    A --> R[Exclusive region task on stackless scheduler]
     R --> E[Owner-local blocks and ECS]
     R --> S[Immutable versioned halo]
-    S --> J[Rayon AI, light and generation jobs]
+    S --> J[Audited plugin-free Rayon jobs]
     J --> A
-    R --> O[Ordered deltas and plugin requests]
+    R --> O[Ordered deltas and owned plugin requests]
     O --> P[Plugin domain dispatcher]
     O --> B[Interest index and egress]
     P --> A
@@ -28,7 +28,7 @@ flowchart LR
 ### Ownership invariants
 
 1. **Unique writer.** A chunk cell and entity have exactly one owner in each published ownership generation. Mutable world APIs require an owner token. Plugins, network tasks, and background Rayon jobs receive commands or snapshots instead of mutable world references.
-2. **One tick in flight per region.** The actor transfers its `RegionState` to a bounded Rayon task for a synchronous simulation step. Incoming messages wait in the mailbox until the state returns. Moving the state container does not copy its component arrays. A Rayon job must finish without awaiting a Tokio future or holding a region guard across `.await`.
+2. **One authoritative turn in flight per region.** The scheduler admits one owner turn at a time. It can hand a finite, plugin-free snapshot computation to Rayon and await its owned result. A plugin-capable turn suspends as a managed future, with its mutable owner borrow released and its dependent transaction parked. Poll serialization alone does not make suspended multi-step work atomic; incoming commands still follow the owner's ordering rules.
 3. **Versioned reads.** A neighbor publishes an immutable `Arc` snapshot of its border or collision halo, labeled with the source owner generation and committed tick. Each subsystem specifies the age it can tolerate. A mutation goes to the owner as a command, and any result that depends on a version is revalidated before commit.
 4. **Ordered commit.** A region applies input and job outputs in a stable order such as `(target_tick, source_id, source_sequence)`. The commit step resolves conflicts because network arrival order alone does not define a deterministic order across sources.
 5. **Bounded queues.** Each mailbox has item and byte budgets. Required gameplay commands receive an explicit overload response or upstream backpressure, while replaceable observations may be coalesced. Without a bound, a CPU hotspot can grow into a memory failure.
@@ -38,7 +38,7 @@ Spatial ownership does not cover world time, weather, scoreboards, player data, 
 
 ### Rust shape of the owner boundary
 
-The following is architectural pseudocode. Types such as `CellId` and `WorldCommand` are proposed and deliberately omit serialization and error details.
+The following is architectural pseudocode. Types such as `CellId` and `WorldCommand` are proposed and deliberately omit serialization and error details. The Rayon function is a plugin-free leaf; plugin decisions are dispatched by the surrounding managed domain task after releasing its owner borrow.
 
 ```rust
 type RegionId = u64;
@@ -70,22 +70,23 @@ struct OwnerToken<'a> {
     state: &'a mut RegionState,
 }
 
-fn simulate_tick(
-    mut state: Box<RegionState>,
+fn plan_plugin_free_batch(
     input: Vec<RegionMsg>,
+    snapshot: Arc<RegionReadSnapshot>,
     halo: Arc<CollisionHalo>,
-) -> (Box<RegionState>, TickOutput) {
-    let mut owner = OwnerToken { region: state.region_id(), state: &mut state };
-    let mut commands = plan_and_simulate(&mut owner, input, &halo);
+) -> Vec<WorldCommand> {
+    plan_from_snapshot(input, &snapshot, &halo) // no plugin entry or await
+}
+
+fn commit_batch(state: &mut RegionState, mut commands: Vec<WorldCommand>) -> TickOutput {
+    let mut owner = OwnerToken { region: state.region_id(), state };
     commands.sort_by_key(|c| (c.target_tick, c.source_id, c.sequence));
     owner.apply_validated(commands); // checks entity and ownership generations
-    let output = owner.take_output();
-    drop(owner); // end the mutable borrow before moving state back to the actor
-    (state, output)
+    owner.take_output()
 }
 ```
 
-The actor takes its `Box<RegionState>` out of its slot, submits `simulate_tick` to Rayon, and waits for a oneshot reply before scheduling another tick. `ArcSwap` makes directory reads cheap and publishes new directory versions atomically; readers do not mutate the state behind a snapshot. Tokio `mpsc` bounds actor ingress. A small `RwLock` may still serve rare control-plane updates, provided world mutation does not depend on acquiring it.
+The managed region task snapshots the inputs for `plan_plugin_free_batch`, submits that bounded leaf to Rayon, and awaits its owned result. It then uses `OwnerToken` for the short commit step. If the turn emits a plugin invocation, the task records the pending transaction, releases the owner borrow, and awaits the plugin through [the dispatch boundary](plugin-pipeline.md); the result is version-checked before commit. Plugin entry from an unmanaged Rayon job is rejected or resubmitted through the scheduler. `ArcSwap` makes directory reads cheap and publishes new versions atomically; readers do not mutate a snapshot. Tokio `mpsc` bounds actor ingress. A small `RwLock` may still serve rare control-plane updates, provided world mutation does not depend on acquiring it.
 
 ### Rebalancing and handoff
 
@@ -132,7 +133,7 @@ fn plan_motion(ecs: &mut RegionEcs, halo: &CollisionHalo) -> Vec<MotionIntent> {
 }
 ```
 
-`par_iter_mut` gives each worker a disjoint batch, which satisfies Rust's mutable aliasing rule. A worker may update independent fields directly or produce an intent from a stable snapshot. Inter-entity collision, combat, mounting, and cross-region movement instead produce intents for the owner to resolve in deterministic order. Structural changes such as spawn, despawn, and component moves occur at owner commit after parallel queries finish. Profiling should determine batch size; a task per entity would usually spend too much time on scheduling.
+`par_iter_mut` gives each worker a disjoint batch, which satisfies Rust's mutable aliasing rule. This function is eligible for Rayon only after its entire call graph is confirmed plugin-free. A worker may update independent fields directly or produce an intent from a stable snapshot. Inter-entity collision, combat, mounting, and cross-region movement instead produce intents for the owner to resolve in deterministic order. Structural changes such as spawn, despawn, and component moves occur at owner commit after parallel queries finish. Profiling should determine batch size; a task per entity would usually spend too much time on scheduling.
 
 AI pathfinding, chunk generation, and lighting can run against snapshots if their results carry `(owner_generation, source_revision)` and the owner can reject or rebase stale work. These jobs need admission limits separate from simulation so a burst of chunk generation cannot consume every worker. [Pumpkin's current chunk scheduler](../../crates/pumpkin-world/src/chunk_system/schedule.rs) already has a bounded generation pool, which provides a behavior to preserve and measure. Some runtime lighting still runs inline during [world mutation](../../crates/pumpkin/src/world/mod.rs); moving it off-thread first requires a rule for when its result becomes visible.
 

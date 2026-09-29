@@ -18,6 +18,7 @@ Correctness needs an equally stable reference. Capture deterministic seeds and t
 
 | Profile | Main question | Minimum record |
 | --- | --- | --- |
+| Small server, 1 to 100 active players | What are the current tick, memory, and plugin costs before adding managed tasks or region routing? | Record idle and active CPU, RSS, tick p99, plugin decision latency, and task or worker activity at 1, 20, and 100 players. |
 | Spread-out players | Does current world-level parallelism use the available cores? | Record players, dimensions, active chunks, a proxy for region distribution, and per-world tick time. |
 | 500 in 3×3 chunks | What do serial interactions and all-to-all replication cost? | Record movers, observers, deliveries per second, bytes per second, and tracking and collision CPU. |
 | Entity-dense world | Which entity types and systems dominate? | Record active entities by type, AI and physics time, and tracking candidates. |

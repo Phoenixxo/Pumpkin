@@ -16,11 +16,12 @@ Each profile must run long enough to expose queue accumulation, retained memory,
 
 | Profile | Required conditions | Failure modes to exercise |
 | --- | --- | --- |
+| Small server, 1 to 100 active players | Replay the [phase 00](00-baseline-and-benchmarks.md) inputs with no plugins, v0.1 plugins, and a mixed ABI set in Global mode; compare Region mode where available. | Detect idle CPU, memory, tick, or plugin-latency regressions caused by extra task admission and routing. |
 | 10,000+ spread-out active players | Players produce real gameplay inputs alongside moving entities, chunk subscriptions, and mixed protocol cohorts. | Exercise burst joins, disconnects, chunk churn, and slow readers. |
 | 500-player 3×3-chunk crowd | Players are mutually visible and produce movement and interactions, with spectators or other observers where applicable. | Measure quadratic fanout, compression cohort misses, and hot-owner backlog. |
 | Tens of thousands of entities | Publish the entity-type and AI/physics mix and keep entities within active simulation range. | Exercise pathfinding spikes, collisions, spawning and despawning, and tracker churn. |
 | Border and migration stress | Repeat crossings, teleports, vehicle and mount transitions, and damage near owner boundaries. | Detect duplicate or lost entities, stale owner generations, and message cycles. |
-| Plugin stress | Run representative v0.1 and v0.2 plugins together with an infinite-loop guest, host-call flood, and deadline expiry. | Detect reactor or Rayon starvation, reentry deadlock, and late state commit. |
+| Plugin stress | Run v0.1 and v0.2 components together under both Global fallback and migrated Region ownership. Include nested same-Store and cross-Store calls, opposing causal roots, an infinite-loop guest, a host-call flood, waiter drop, and caller deadline expiry. | Detect legacy-gate unfairness, Store-owner stalls, reactor or Rayon starvation, reentry deadlock, accepted work lost on waiter drop, and late state commit. Check that fuel or epoch interruption contains CPU-bound guests. |
 | Storage and generation | Continue chunk loading, generation, lighting, and saves during active play. | Detect background-pool starvation, stale snapshot publication, and I/O backlog. |
 
 ## Proposed acceptance measurements
@@ -31,12 +32,12 @@ These targets are proposed acceptance criteria, not measured current results. If
 - **Delivery:** Publish p50, p95, and p99 input-to-commit and commit-to-client-send latency for nearby movement, block placement, and required state transitions. When movement is coalesced, also report the age of visible state.
 - **Correctness:** Entity transfers are neither lost nor duplicated, and a stale command cannot commit under a new owner generation. Cancellation and collision match the declared compatibility contract, and deterministic replay reaches the expected authoritative state.
 - **Bounded resources:** Ingress, plugin, background-job, per-client egress, and global egress byte limits remain effective. RSS and queue age remain bounded during a soak and a slow-reader attack.
-- **Isolation:** A saturated hotspot or timed-out WASM plugin stays within the published latency budget for unrelated regions. Required transactions follow their documented timeout policy.
+- **Isolation:** A saturated hotspot or guest interrupted under the configured fuel or epoch policy stays within the published latency budget for unrelated regions. Required transactions follow their documented timeout policy; a caller deadline alone does not imply guest cancellation.
 - **Protocol:** Java zlib and Bedrock transport interoperate with the targeted clients. Per-connection encryption and required-packet ordering remain correct when compatible frames are shared.
 
 ## Capacity accounting
 
-Capacity results need the resource demand and delivered workload in the same record. For each profile, report physical cores and CPU utilization; memory and retained frame bytes; NIC line rate and payload/wire throughput; movers, observers, deliveries per second, and compressed-frame cache hit rate; active entities and chunks; background-job backlog; and plugin decision and host-call rates. Identify whether the server or load generator set the observed limit.
+Capacity results need the resource demand and delivered workload in the same record. For each profile, report physical cores and CPU utilization; memory and retained frame bytes; NIC line rate and payload/wire throughput; movers, observers, deliveries per second, and compressed-frame cache hit rate; active entities and chunks; background-job backlog; plugin decision and host-call rates by ABI lane; and managed-task queue age by domain. Identify whether the server or load generator set the observed limit. Report the fixed small-server profile as well as the capacity profiles so scheduler and routing overhead cannot hide behind dense-load gains.
 
 The crowd calculation from the [overview](../architecture/overview.md) gives a planning lower bound: 500 movers visible to 499 others at 20 updates per second create 4.99 million deliveries per second. If the required protocol and visibility semantics demand more CPU or bandwidth than the host provides, report that limit. Coalescing visual updates may lower delivery count, but it cannot support a claim that every observer received every intermediate move.
 
