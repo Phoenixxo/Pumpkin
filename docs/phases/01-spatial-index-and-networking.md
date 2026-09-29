@@ -1,63 +1,62 @@
-# Phase 01 — Spatial interest index and bounded networking
-
-**Status:** implementation plan; no changes described here are implemented by this document. The plan targets Pumpkin upstream at `4426d1113`. Read the [documentation index](../README.md), [system overview](../architecture/overview.md), and [networking design](../architecture/networking.md) for the capacity model and data path. This phase follows [phase 00: baseline and benchmarks](00-baseline-and-benchmarks.md).
+# Phase 01 - Spatial interest index and bounded networking
+This phase builds on the measurements from [phase 00](00-baseline-and-benchmarks.md) and describes proposed changes to upstream Pumpkin at `4426d1113`. The [documentation index](../README.md), [system overview](../architecture/overview.md), and [networking design](../architecture/networking.md) provide the broader capacity model and data path.
 
 ## Outcome and scope
 
-Replace repeated world-player scans with an observer index and make ingress and egress memory bounded at both connection and process scope. Preserve existing Java/Bedrock wire behavior and required packet ordering. The intended measurable result is less lookup and repeated encoding/compression work under dense fanout, bounded memory under slow readers, and no regression in client-visible correctness.
+Pumpkin can avoid repeated world-player scans by maintaining an index of observers for each watched area. The same phase gives incoming and outgoing work explicit memory budgets at both connection and process scope. It must preserve Java and Bedrock wire behavior and the ordering of required packets. Success means less lookup and repeated encoding or compression work under dense fanout, bounded memory under slow readers, and equivalent client-visible state.
 
-This phase does not require region actors or ECS. It should expose stable owner and observer interfaces that [phase 03](03-region-ownership.md) and [phase 04](04-ecs-migration.md) can adopt. Cancellable events remain governed by the [plugin design](../architecture/plugin-pipeline.md) and [phase 02](02-plugin-execution.md).
+The observer interface should remain stable when [phase 03](03-region-ownership.md) introduces region owners and [phase 04](04-ecs-migration.md) changes entity storage. Neither region actors nor ECS are prerequisites here. Cancellable events continue to follow the [plugin design](../architecture/plugin-pipeline.md) and [phase 02](02-plugin-execution.md).
 
 ## Source touchpoints
 
 | Current source | Existing behavior to preserve or replace |
 |---|---|
-| [`World::broadcast_to_chunk` and related methods](../../crates/pumpkin/src/world/mod.rs) | Scan world players, test `watched_section`, group Java clients by protocol version, serialize once per Java version, serialize Bedrock per recipient. Preserve the current visibility predicate until a validated subscription lifecycle replaces it. |
-| [Java decoder](../../crates/pumpkin-protocol/src/java/packet_decoder.rs) | Validates lengths and returns frozen `Bytes` payloads after optional decrypt/decompress. Keep existing bounds and zero-extra-copy behavior on eligible paths. |
-| [Java encoder](../../crates/pumpkin-protocol/src/java/packet_encoder.rs), [client queue](../../crates/pumpkin/src/net/java/mod.rs), and [outgoing writer](../../crates/pumpkin/src/net/java/outgoing.rs) | Reuses compression scratch, batches frames, offloads compressing batches through `spawn_blocking`, encrypts with a connection-owned stream cipher, and has normal/priority unbounded channels with per-client byte accounting. |
-| [Bedrock encoder](../../crates/pumpkin-protocol/src/bedrock/packet_encoder.rs) and [Bedrock queue/writer](../../crates/pumpkin/src/net/bedrock/mod.rs) | Uses edition-specific packet framing/compression and an outbound pending-byte guard; its current send path includes a copy into the transport session. |
-| [Packet limiter](../../crates/pumpkin/src/net/packet_limiter.rs) and [network cap](../../crates/pumpkin/src/net/mod.rs) | A per-client packet-count token bucket and a 64 MiB per-client pending-payload threshold exist. Neither supplies a process-wide byte cap. |
+| [`World::broadcast_to_chunk` and related methods](../../crates/pumpkin/src/world/mod.rs) | These methods scan world players, test `watched_section`, group Java clients by protocol version, serialize once per Java version, and serialize Bedrock per recipient. The current visibility predicate remains the compatibility reference until a validated subscription lifecycle replaces it. |
+| [Java decoder](../../crates/pumpkin-protocol/src/java/packet_decoder.rs) | The decoder validates lengths and returns frozen `Bytes` payloads after optional decryption and decompression. Eligible paths should retain their existing bounds and avoid an extra copy. |
+| [Java encoder](../../crates/pumpkin-protocol/src/java/packet_encoder.rs), [client queue](../../crates/pumpkin/src/net/java/mod.rs), and [outgoing writer](../../crates/pumpkin/src/net/java/outgoing.rs) | The writer reuses compression scratch, batches frames, offloads compression through `spawn_blocking`, and encrypts with a connection-owned stream cipher. Normal and priority channels are unbounded, although per-client bytes are accounted for. |
+| [Bedrock encoder](../../crates/pumpkin-protocol/src/bedrock/packet_encoder.rs) and [Bedrock queue/writer](../../crates/pumpkin/src/net/bedrock/mod.rs) | Bedrock uses its own framing and compression and guards outbound pending bytes. Its current send path also copies data into the transport session. |
+| [Packet limiter](../../crates/pumpkin/src/net/packet_limiter.rs) and [network cap](../../crates/pumpkin/src/net/mod.rs) | The server has a per-client packet-count token bucket and a 64 MiB per-client pending-payload threshold. Neither mechanism imposes a process-wide byte cap. |
 
 ## Delivery sequence
 
 ### 1. Instrument the old path
 
-Use the fixed workloads and hardware in [phase 00](00-baseline-and-benchmarks.md). Add low-cardinality metrics around `broadcast_to_chunk`, per-edition serialization, Java frame creation/compression, encryption, socket writes, and ingress decode. Capture allocation profiles for both sparse and 500-player/3×3-chunk scenes. Establish count and age of pending required and replaceable packets, plus RSS.
+Use the fixed workloads and hardware from [phase 00](00-baseline-and-benchmarks.md) to establish a before-and-after comparison. Low-cardinality metrics should cover `broadcast_to_chunk`, serialization by edition, Java frame creation and compression, encryption, socket writes, and ingress decoding. Allocation profiles should include both sparse worlds and the 500-player/3×3-chunk scene. Record the number and age of pending required and replaceable packets alongside RSS.
 
-For benchmark validity, report the same client versions, compression settings, view distance, chunk churn, entity count, and plugin load before and after the changes. Measure p99 commit-to-write time as well as p99 tick time. A faster serializer with older client-visible state is not a successful outcome.
+Keep client versions, compression settings, view distance, chunk churn, entity count, and plugin load constant across comparisons. Measure p99 commit-to-write time alongside p99 tick time: reducing serializer CPU does not help if clients see older state.
 
 ### 2. Introduce an observer index behind the current broadcast API
 
-Create an index keyed by dimension and watched section or chunk. Store stable player IDs and a connection generation; resolve a live peer only at send time. Apply changes when watch radius, section, dimension, chunk delivery, or disconnect changes. Publish read-only snapshots in batches, using a short mutation lock or owner task rather than holding a world-wide lock throughout fanout.
+The proposed index maps each dimension and watched section or chunk to stable player IDs and connection generations. A send resolves the current peer from that identity, which prevents a stale subscription from reaching a replacement connection. Watch radius, section, dimension, chunk delivery, and disconnect changes update the index. Batched read-only snapshots give broadcasts a stable view while a short mutation lock or owner task applies changes; fanout should not hold a world-wide lock.
 
-Keep `World::broadcast_to_chunk` signatures as compatibility facades during the migration. Run indexed and scanned recipient selection together in shadow mode on test and benchmark workloads; compare exact recipient IDs and ordering, without double-sending. Only switch the live path after mismatches are explained. The index must ensure a client gets its spawn/chunk baseline before dependent deltas and does not receive updates after despawn. Where the old watched-section predicate overapproximates actual chunk load, choose the compatibility rule deliberately and test it with clients.
+`World::broadcast_to_chunk` can remain the compatibility facade during migration. In shadow mode, the index and current scan both select recipients for test and benchmark workloads, but only one path sends packets. Compare exact recipient IDs and ordering, investigate every mismatch, and switch the live path only when the chosen behavior is understood. A client must receive its spawn or chunk baseline before dependent deltas and must stop receiving updates after despawn. If the current watched-section predicate includes areas whose chunks have not loaded, state and test the chosen compatibility rule with real clients.
 
-The index should expose a versioned snapshot interface to the [spatial ownership design](../architecture/spatial-ownership-and-ecs.md), so a later region owner can ask for observers without knowing today’s `World::players` representation.
+A versioned snapshot interface lets the later [spatial owner](../architecture/spatial-ownership-and-ecs.md) find observers without depending on today's `World::players` representation.
 
 ### 3. Define wire profiles and share compatible frames
 
-Keep the existing Java serialization-per-version optimization. Group further only when the resulting **bytes and framing** are identical: edition, protocol version, negotiated features, packet fields and IDs, recipient-specific entity identifiers, position baseline, compression enabled/threshold/level, and visibility result. Add bounded, short-lived frame reuse for compatible Java recipients. The current `TCPNetworkEncoder::write_frame` can remain the connection-owned encryption boundary; frame preparation must not share or advance another connection's cipher state.
+The existing Java serialization-per-version optimization is the starting point. A frame can be shared more widely only when its **bytes and framing** are identical. Compatibility therefore depends on edition, protocol version, negotiated features, packet fields and IDs, recipient-specific entity identifiers, position baseline, compression enabled/threshold/level, and visibility result. Compatible Java recipients can reuse a bounded, short-lived prepared frame. `TCPNetworkEncoder::write_frame` remains the connection-owned encryption boundary: shared preparation never advances another connection's cipher state.
 
-Do not replace the Java zlib frame with Zstandard. The Bedrock path gets a separate codec and framing analysis, with real-client compatibility before any frame-reuse change. Benchmark codec implementations or SIMD kernels only when profiles identify compression or interest filtering as a meaningful share of CPU. Track cache hits, misses by reason, saved encode/compression work, and frame residency.
+Java's wire contract requires zlib framing, so Zstandard cannot replace it on that path. Bedrock needs its own codec and framing analysis, followed by real-client compatibility checks before frame reuse changes. Codec implementations or SIMD kernels deserve evaluation when profiles show that compression or interest filtering consumes a meaningful share of CPU. The measurements should include cache hits, misses by reason, saved encode and compression work, and frame residency.
 
 ### 4. Bound outgoing work and retain ordering
 
-Replace or wrap each unbounded normal/priority queue with weighted per-client and process-wide byte admission. A successful enqueue owns reservations until send, replacement, cancellation, or disconnect; every exit path releases them exactly once. Use an atomic compare-exchange loop or weighted semaphore to avoid an overcommit race between checking capacity and incrementing it. Include queue-node overhead and shared-frame residency in memory telemetry. Derive cap values from the host memory envelope rather than from the current per-client 64 MiB threshold.
+Each unbounded normal or priority queue needs weighted byte admission at both client and process scope. Once an enqueue succeeds, it holds its reservations until send, replacement, cancellation, or disconnect; every exit path releases them exactly once. An atomic compare-exchange loop or weighted semaphore makes the capacity check and reservation one operation, avoiding concurrent overcommit. Memory telemetry must include queue-node overhead and retained shared frames. The host memory envelope should determine cap values, rather than inheriting the current 64 MiB per-client threshold.
 
-Classify packet families:
+Packet families need different policies because some state can be replaced while other state forms the client's protocol history:
 
 | Class | Queue rule | Required check |
 |---|---|---|
-| Required ordered state | Maintain protocol order and reserve control capacity. Apply a time-bounded slow-client disconnect policy when required state cannot drain. | No silently missing spawn, despawn, chunk, inventory, or correction. |
-| Replaceable state | Retain the newest semantic value by recipient/entity/field under a freshness budget. Encode against the last **transmitted** baseline, or send an absolute resynchronization. | Dropping an intermediate relative update cannot corrupt later position or rotation. |
+| Required ordered state | Maintain protocol order and reserve control capacity. Disconnect a persistently slow client within a bounded time when required state cannot drain. | Spawn, despawn, chunk, inventory, and correction packets must not disappear silently. |
+| Replaceable state | Retain the newest semantic value by recipient, entity, and field within a freshness budget. Encode against the last **transmitted** baseline or send an absolute resynchronization. | Dropping an intermediate relative update must not corrupt later position or rotation. |
 
-Owner and gameplay paths use nonblocking offer. Queue-full handling cannot wait on a Tokio socket, a compression task, or a peer's connection mutex. Enforce fairness so high-priority traffic does not indefinitely starve normal state.
+Owner and gameplay paths offer packets without waiting. When a queue is full, they must apply the class policy immediately rather than wait on a Tokio socket, compression task, or peer connection mutex. The writer also needs fairness so priority traffic cannot starve normal state indefinitely.
 
 ### 5. Add weighted ingress admission
 
-Retain the packet-count token bucket, then add wire-byte and decoded-byte budgets per connection and globally. Limit owner-mailbox items and bytes. Charge expensive decompression/parse paths before they can monopolize CPU, subject to protocol-correct rejection and disconnect behavior. A full owner queue pauses connection reads or rejects according to a documented policy; it does not grow unbounded.
+The existing packet-count token bucket remains useful, but it cannot account for packet size or decompression expansion. Add wire-byte and decoded-byte budgets per connection and globally, and bound owner mailboxes by both items and bytes. Expensive decompression and parsing should consume admission budget before they can monopolize CPU, with protocol-correct rejection or disconnect behavior. When an owner queue fills, the connection pauses reads or rejects work according to a documented policy.
 
-The Java `BytesMut → Bytes` payload path remains, and packet handlers may retain shared backing bytes only while their command owns it. Measure retained receive-buffer bytes as well as allocation counts. Memory-mapped buffers are not part of the socket path.
+The Java `BytesMut → Bytes` payload path remains. A handler may retain shared backing bytes while its command owns them, but retained receive-buffer bytes need measurement alongside allocation counts. Memory-mapped buffers do not improve the live socket path here.
 
 ## Correctness invariants
 
@@ -72,12 +71,12 @@ The Java `BytesMut → Bytes` payload path remains, and packet handlers may reta
 
 | Gate | Workload and evidence |
 |---|---|
-| Interest parity | Deterministic watcher movement, view-radius changes, teleports/dimension changes, chunk delivery and disconnect; shadow index equals intended scan behavior or documented corrected behavior. Property tests cover subscription add/remove generations. |
-| Java protocol | Supported versions with compression off/on and encryption off/on, including threshold boundaries; byte-for-byte or decoded-packet equivalence for shared versus per-connection frames. |
-| Bedrock protocol | Encoder/decoder round trips and real-client smoke tests for the negotiated compression path, mixed editions, and recipient-specific payloads. |
-| Backpressure | One slow reader, many slow readers, priority saturation, and disconnect during a queued shared frame. RSS and queue bytes remain within configured budgets; required packets are ordered or the connection closes. |
-| Coalescing | Drop/replacement schedules around spawn, teleport, relative movement, and despawn. Reconstructed client state equals the latest committed state within the configured age budget. |
-| Dense fanout | 500 players in 3×3 chunks, plus a 1,000-observer broadcast and 10,000 mostly idle connections. Record recipient deliveries/s, bytes/s, CPU by encode/compress/encrypt/write, cache hit rate, RSS, p99 tick, and p99 commit-to-write delay. |
-| Sparse world | Distant players and active entities with low shared visibility. Index maintenance and cache overhead must not regress p99 latency materially against phase 00. |
+| Interest parity | Exercise watcher movement, view-radius changes, teleports, dimension changes, chunk delivery, and disconnect deterministically. The shadow index must match the intended scan behavior or a documented correction; property tests cover subscription add and remove generations. |
+| Java protocol | Test supported versions with compression and encryption on and off, including threshold boundaries. Shared and per-connection frames must be byte-for-byte equivalent or decode to equivalent packets. |
+| Bedrock protocol | Run encoder and decoder round trips and real-client smoke tests for negotiated compression, mixed editions, and recipient-specific payloads. |
+| Backpressure | Exercise one and many slow readers, priority saturation, and disconnect while a shared frame is queued. RSS and queue bytes must stay within budgets, and required packets must remain ordered or the connection must close. |
+| Coalescing | Exercise drop and replacement schedules around spawn, teleport, relative movement, and despawn. Reconstructed client state must reach the latest committed state within the configured age budget. |
+| Dense fanout | Exercise 500 players in 3×3 chunks, a 1,000-observer broadcast, and 10,000 mostly idle connections. Record deliveries and bytes per second, CPU by encode/compress/encrypt/write, cache hit rate, RSS, p99 tick, and p99 commit-to-write delay. |
+| Sparse world | Exercise distant players and active entities with little shared visibility. Index maintenance and cache overhead must not materially regress p99 latency against phase 00. |
 
-The phase is complete when protocol and ordering gates pass, per-client **and global** queue bounds hold under the slow-reader tests, and the fixed benchmark shows the measured fanout gain without hiding stale client state. Publish the benchmark configuration and results; the 10,000-player target itself is evaluated in [phase 05](05-capacity-validation.md). The cross-pillar risk register is in the [bottleneck matrix](../architecture/bottlenecks.md).
+Completion requires protocol and ordering parity, per-client **and global** queue bounds under slow-reader tests, and a measured fanout gain without stale client state. Publish the benchmark configuration and results. [Phase 05](05-capacity-validation.md) evaluates the 10,000-player target, while the [bottleneck matrix](../architecture/bottlenecks.md) tracks risks across pillars.

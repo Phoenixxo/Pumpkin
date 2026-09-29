@@ -1,32 +1,34 @@
-# Phase 04 — Owner-local ECS migration
+# Phase 04 - Owner-local ECS migration
 
-**Status:** implementation plan, not current behavior. [Phase 03](03-region-ownership.md) establishes exclusive region ownership; [spatial ownership and ECS](../architecture/spatial-ownership-and-ecs.md) defines the proposed data layout. [Phase 00](00-baseline-and-benchmarks.md) supplies the comparison workload, and [phase 05](05-capacity-validation.md) evaluates the full capacity target.
+[Phase 03](03-region-ownership.md) establishes exclusive region ownership. This phase uses it to migrate hot entity data to the layout described in [spatial ownership and ECS](../architecture/spatial-ownership-and-ecs.md). The comparison workload comes from [phase 00](00-baseline-and-benchmarks.md); [phase 05](05-capacity-validation.md) evaluates the full capacity target.
 
 ## Outcome and baseline
 
-Move the hot transform, velocity, hitbox, and spatial-membership paths to cache-friendly columns while preserving UUIDs, protocol entity IDs, plugin handles, physics, collision, and lifecycle behavior. Upstream at `4426d1113` uses `ArcSwap<Vec<Arc<dyn EntityBase>>>` and atomics/locks in [world](../../crates/pumpkin/src/world/mod.rs) and [entity](../../crates/pumpkin/src/entity/mod.rs). World ticks already use Rayon, so the goal is to make that work cheaper and safely owner-local, not to add a parallel iterator around the existing pointer graph.
+The proposed layout places transforms, velocities, hitboxes, and spatial membership in cache-friendly columns. UUIDs, protocol entity IDs, plugin handles, physics, collision, and lifecycle behavior remain compatible. Upstream at `4426d1113` stores entities through `ArcSwap<Vec<Arc<dyn EntityBase>>>` with atomics and locks in [world](../../crates/pumpkin/src/world/mod.rs) and [entity](../../crates/pumpkin/src/entity/mod.rs). World ticks already use Rayon. The opportunity is to reduce pointer chasing and contention within owner-local work, rather than add another parallel iterator around the existing pointer graph.
 
 ## Migration sequence
 
+Entity identity must become independent of storage location before columns can move or compact. The sequence then pilots a small set of hot fields, makes system access explicit, and migrates entity families only after replay shows equivalent behavior.
+
 ### 4.1 Establish stable identity and a compatibility facade
 
-Introduce a generational internal `EntityKey` and locator mapping to `(world, region, batch, row, owner_generation)`. Keep external UUID and protocol entity IDs stable across compaction and region transfer. Wrap current `EntityBase` lookups behind a facade that resolves the key through the owner; plugin and packet APIs do not receive a raw row pointer that can outlive a structural mutation. Count stale lookups and generation failures.
+An internal generational `EntityKey` should resolve through a locator to `(world, region, batch, row, owner_generation)`. External UUIDs and protocol entity IDs stay stable when rows compact or cross regions. A compatibility facade can resolve existing `EntityBase` lookups through the owner; plugin and packet APIs should not retain row pointers across structural changes. Counters for stale lookups and generation failures reveal incorrect lifetimes.
 
 ### 4.2 Pilot hot SoA columns
 
-Implement aligned batches containing sequential position, velocity, and hitbox arrays. Keep sparse or cold data—inventory, AI memory, scoreboard links, plugin-specific metadata—in separate storage. Preserve position precision and collision rules until compatibility traces prove a deliberate change safe. Batch sizes, alignment, and storage library choice are selected by profile; `hecs`, `bevy_ecs`, or a small purpose-built SoA each have different scheduling and structural-change costs.
+The pilot stores positions, velocities, and hitboxes in sequential aligned arrays. Inventory, AI memory, scoreboard links, and plugin-specific metadata remain in separate sparse or cold storage. Position precision and collision rules stay intact unless compatibility traces justify a deliberate change. Profiles should determine batch size, alignment, and whether `hecs`, `bevy_ecs`, or a small purpose-built structure-of-arrays fits best; each has different scheduling and structural-change costs.
 
 ### 4.3 Make systems explicit
 
-Define read and write sets for movement, broad-phase collision, narrow-phase collision, combat, AI, and tracking. A Rayon `par_iter_mut` over disjoint batches can update independent columns or produce `MotionIntent` values from immutable collision halos. Interacting entities are resolved by their owner in a stable order. Do not have two workers mutate the same entity or both sides of a collision directly. If an ECS library already schedules systems from component access, avoid an additional unconstrained Rayon scheduler over the same systems.
+Movement, broad-phase collision, narrow-phase collision, combat, AI, and tracking each need declared read and write sets. Rayon `par_iter_mut` over disjoint batches can update independent columns or derive `MotionIntent` values from immutable collision halos. The owner resolves interactions between entities in a stable order, so two workers never mutate the same entity or opposite sides of a collision concurrently. If the selected ECS library schedules systems from component access, its scheduler should coordinate with Rayon rather than run a second unconstrained schedule over the same data.
 
 ### 4.4 Batch structural changes and transfers
 
-Collect spawn, despawn, mount, component-add/remove, and cross-region movement requests during parallel work. At the owner commit point, apply them in deterministic order and update the locator atomically with the batch row changes. Ensure `ArcSwap` compatibility snapshots, if retained temporarily, cannot become a second authoritative store. Transfer whole component rows and pending commands at the [phase 03](03-region-ownership.md) handoff boundary; old owner generations reject stale jobs.
+Parallel systems collect spawn, despawn, mount, component-add/remove, and cross-region movement requests instead of changing table shape mid-query. The owner applies those requests in deterministic order at commit and updates the locator atomically with row changes. If `ArcSwap` compatibility snapshots remain temporarily, they serve readers but cannot become a second authoritative store. At the [phase 03](03-region-ownership.md) handoff boundary, whole component rows and pending commands transfer together; old owner generations reject stale jobs.
 
 ### 4.5 Migrate one entity family at a time
 
-Start with a family whose movement and collision behavior is covered by deterministic replay. Run old and new systems in shadow mode against the same immutable inputs without double-applying output. Compare state hashes, collision candidates, packet deltas, and plugin-visible fields. Expand to other entities, players, vehicles, and complex mounting behavior after parity is shown. Keep rollback at a tick boundary while a family is still dual-represented.
+The first family should have movement and collision behavior covered by deterministic replay. Run old and new systems in shadow mode over the same immutable inputs, applying only one output. Compare state hashes, collision candidates, packet deltas, and plugin-visible fields before extending the migration to other entities, players, vehicles, or complex mounts. While a family is dual-represented, rollback remains a tick-boundary operation.
 
 ## Memory and concurrency invariants
 
@@ -38,12 +40,14 @@ Start with a family whose movement and collision behavior is covered by determin
 
 ## Validation gate
 
+The gate requires gameplay parity and stable ownership before treating lower cycles per entity as a useful improvement.
+
 | Evidence | Required result |
 | --- | --- |
-| Gameplay parity | Movement, collision, damage, mounting, spawn/despawn, and plugin-visible state match the declared baseline trace for each migrated family. |
-| Ownership safety | Tests and debug assertions detect no dual writer, stale-row mutation, or accepted old-generation command under transfer and compaction stress. |
-| Determinism | The same ordered inputs yield the same authoritative state under one and many Rayon workers, excluding explicitly documented nondeterministic observations. |
-| Performance | Profile cycles/entity tick, LLC misses, allocation rate, lock/atomic contention, rows moved, and p99 region tick against [phase 00](00-baseline-and-benchmarks.md). Dense and sparse worlds both appear in the comparison. |
-| Lifecycle | Repeated spawn/despawn, teleport, dimension change, vehicle/passenger transitions, save/load, and region migration do not lose or duplicate entities. |
+| Gameplay parity | Movement, collision, damage, mounting, spawn/despawn, and plugin-visible state must match the declared baseline trace for each migrated family. |
+| Ownership safety | Tests and debug assertions must detect any dual writer, stale-row mutation, or accepted old-generation command under transfer and compaction stress. |
+| Determinism | The same ordered inputs must yield the same authoritative state with one or many Rayon workers, apart from explicitly documented nondeterministic observations. |
+| Performance | Profile cycles per entity tick, LLC misses, allocation rate, lock and atomic contention, rows moved, and p99 region tick against [phase 00](00-baseline-and-benchmarks.md). Compare both dense and sparse worlds. |
+| Lifecycle | Repeated spawn/despawn, teleport, dimension change, vehicle/passenger transitions, save/load, and region migration must not lose or duplicate entities. |
 
-The phase is complete when correctness passes and the fixed workload shows a measured improvement without increasing p99 tick time or unbounded memory. It does not itself prove 10,000-player capacity; that belongs to [phase 05](05-capacity-validation.md).
+Completion requires correctness and a measured improvement on the fixed workload without higher p99 tick time or unbounded memory growth. [Phase 05](05-capacity-validation.md) tests whether those improvements translate into 10,000-player capacity.

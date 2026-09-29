@@ -1,50 +1,54 @@
-# Phase 02 — Bounded plugin execution
+# Phase 02 - Bounded plugin execution
 
-**Status:** implementation plan. [Phase 00](00-baseline-and-benchmarks.md) defines the benchmark; [phase 01](01-spatial-index-and-networking.md) bounds network work; [phase 03](03-region-ownership.md) later adds real region owners. The architectural contract is in the [plugin pipeline](../architecture/plugin-pipeline.md).
+This phase applies the [plugin pipeline](../architecture/plugin-pipeline.md) to the workload defined in [phase 00](00-baseline-and-benchmarks.md). It follows the network bounds in [phase 01](01-spatial-index-and-networking.md) and establishes an invocation contract that [phase 03](03-region-ownership.md) can route to region owners.
 
 ## Outcome
 
-Preserve v0.1 cancellation and returned-event behavior while preventing WASM guest CPU, host calls, or queues from indefinitely occupying core workers. Create an owned invocation and reply boundary that can later route to World, Region, and Entity domains. Upstream at `4426d1113` has neither Region execution nor an async v0.2 WIT host.
+The design must preserve v0.1 cancellation and returned-event behavior while bounding the effect of guest CPU, host calls, and queued work on core workers. An invocation should own its request and reply so that later execution domains can route it to a world, region, or entity. Upstream at `4426d1113` does not yet provide Region execution or an async v0.2 WIT host.
 
 ## Baseline to retain
 
-The [plugin manager](../../crates/pumpkin/src/plugin/mod.rs) currently awaits both mutable and immutable handler groups. `fire_blocking` bridges from synchronous callers. The [WASM loader](../../crates/pumpkin/src/plugin/loader/wasm/mod.rs) instantiates a `LegacySyncReentry` gate attached to that loader, and the [Store executor](../../crates/pumpkin-plugin-runtime/src/executor.rs) has bounded channels and reentry support. Current [movement](../../crates/pumpkin/src/net/java/play/player_position.rs) and [block placement](../../crates/pumpkin/src/block/registry.rs) are decision events. Upstream's [`pumpkin-scheduler` crate](../../crates/pumpkin-scheduler/src/domain.rs) documents only Global admission and is not wired into `pumpkin`; it supplies an upstream starting point rather than a live region or plugin scheduler.
+The [plugin manager](../../crates/pumpkin/src/plugin/mod.rs) currently awaits both mutable and immutable handler groups, and `fire_blocking` bridges synchronous callers into that path. The [WASM loader](../../crates/pumpkin/src/plugin/loader/wasm/mod.rs) attaches a `LegacySyncReentry` gate to its loader; the [Store executor](../../crates/pumpkin-plugin-runtime/src/executor.rs) already has bounded channels and reentry support. [Movement](../../crates/pumpkin/src/net/java/play/player_position.rs) and [block placement](../../crates/pumpkin/src/block/registry.rs) require decisions before gameplay can commit. Upstream's [`pumpkin-scheduler` crate](../../crates/pumpkin-scheduler/src/domain.rs) documents Global admission but is not wired into `pumpkin`. It is a useful starting point, not a live region or plugin scheduler.
 
-## Delivery packages
+## Implementation sequence
+
+The sequence first makes existing event semantics explicit, then introduces a single admission rule and owned invocation boundary. Resource limits and the new ABI follow once that boundary can reject, time out, and discard work safely.
 
 ### 2.1 Inventory event semantics and host calls
 
-List every native and WASM entrypoint, event handler category, synchronous bridge, and host import. Mark events as decision or observation, their mutation/cancellation behavior, allowed coalescing, and required ordering. Include command, lifecycle, scheduled-task, and nested plugin calls; a policy that covers only packet events is incomplete. Record which host APIs can block, use I/O, mutate world state, or reenter plugin dispatch.
+An inventory of native and WASM entrypoints, event categories, synchronous bridges, and host imports establishes which calls need a decision before commit and which merely observe committed state. For each event, record mutation and cancellation behavior, permitted coalescing, and required ordering. The inventory must cover commands, lifecycle hooks, scheduled tasks, and nested calls as well as packet events. It should also identify host APIs that can block, perform I/O, mutate world state, or reenter dispatch.
 
 ### 2.2 Add one causal admission boundary for legacy semantics
 
-Integrate and extend upstream's [Global scheduler](../../crates/pumpkin-scheduler/src/global.rs) as a fair chain-aware admission rule above the entire plugin manager, including native and WASM handlers, for operations still requiring one legacy global order. Nested calls reuse their chain ID; opposing roots queue fairly. This is a **transitional compatibility policy**, not a second competing scheduler. Keep the existing Store reentry mechanism and one outer synchronous bridge while callers are migrated; do not introduce a second Tokio runtime or recursive `block_on`. Instrument queue age and occupancy because the gate can limit throughput under high-frequency movement.
+Operations that still require legacy global order need one fair, chain-aware admission rule above the entire plugin manager, including native and WASM handlers. Extend and integrate upstream's [Global scheduler](../../crates/pumpkin-scheduler/src/global.rs) for that role. Nested calls reuse the causal chain ID; independent roots queue fairly. This **transitional compatibility policy** shares one ordering boundary rather than adding a competing scheduler. During migration, retain the Store reentry mechanism and one outer synchronous bridge. A second Tokio runtime or recursive `block_on` would create another blocking path. Measure gate occupancy and queue age, especially under high-frequency movement.
 
 ### 2.3 Define owned invocation and decision replies
 
-Introduce `InvocationId`, causal chain, origin domain, target generation, immutable event snapshot, deadline, and fail policy. Submit decisions through a bounded queue. The caller stages its transaction and receives an owned result; on return it revalidates event/source version and owner generation before commit. A timeout produces an explicit fail result, client correction where needed, and rejection of later replies. Observation events publish after commit through a separate bounded queue.
+Each invocation should carry an `InvocationId`, causal chain, origin domain, target generation, immutable event snapshot, deadline, and fail policy. Decision requests enter a bounded queue while the caller parks its staged transaction. On reply, the caller revalidates the event or source version and owner generation before committing. A timeout produces an explicit failure result and, where necessary, a client correction; a late reply cannot commit. Observation events use a separate bounded queue after commit.
 
-The current world path may initially stand in for an unimplemented Region domain. Do not imply parallel region mutation until [phase 03](03-region-ownership.md) establishes owner tokens. Same-region host calls require a staged overlay or other explicit read-your-writes rule; without it, an event that awaits a request to its own parked owner can deadlock.
+Until [phase 03](03-region-ownership.md) establishes owner tokens, the current world path can stand in for a future Region domain. Parallel region mutation is not available at this stage. A same-region host call needs a staged overlay or another explicit read-your-writes rule; otherwise an event can wait for a request to the owner whose transaction it has parked.
 
 ### 2.4 Add WASM and host budgets
 
-Configure fuel and/or epoch yielding/trapping in the pinned Wasmtime revision, with tests that prove a tight loop yields or traps within its budget. Set wall-clock deadlines, Store resource limits, per-plugin event and host-call queue limits, host-call count and byte budgets, and per-import timeouts. Charge host work separately from guest fuel. Keep guest execution off Tokio I/O reactor workers and off Rayon simulation workers, using bounded executor capacity. The current memory limiter alone is insufficient.
+Configure fuel and/or epoch yielding or trapping in the pinned Wasmtime revision, and prove with a tight-loop test that the configured limit takes effect. Wall-clock deadlines, Store resource limits, per-plugin event and host-call queue limits, host-call count and byte budgets, and per-import timeouts bound work that fuel cannot see. Charge host work separately from guest instructions. Bounded executor capacity keeps guest execution off Tokio I/O reactor workers and Rayon simulation workers. A memory limiter alone cannot provide this isolation.
 
-Use a circuit breaker with diagnostics for repeatedly failing plugins. Define unload and shutdown behavior for queued and in-flight calls. Native callbacks cannot be preempted by WASM fuel; require cooperative async behavior, a separately isolated process, or clearly state the weaker guarantee for trusted native plugins.
+Repeated plugin failures should trip a circuit breaker with diagnostics. Unload and shutdown must either drain or reject queued and in-flight calls according to a defined lifecycle policy. WASM fuel cannot preempt a native callback, so trusted native plugins need cooperative async behavior, process isolation, or a documented weaker guarantee.
 
 ### 2.5 Specify and integrate an async v0.2 ABI without redefining v0.1
 
-Specify the async WIT callbacks and host imports as an upstream-facing contract, then add negotiation and a host implementation behind the new ABI. Preserve the existing [v0.1 WIT](../../crates/pumpkin-plugin-wit/v0.1/plugin.wit) behavior until plugins opt in. Domain-aware host calls carry owned inputs and replies, and the Store remains owned by one logical task unless a plugin declares and implements partitioned state. Avoid copying large network payloads into WIT events when a compact typed snapshot suffices; no end-to-end socket-to-WASM zero-copy claim is made.
+Specify async WIT callbacks and host imports as an upstream-facing contract, then implement negotiation and the new host boundary. Existing [v0.1 WIT](../../crates/pumpkin-plugin-wit/v0.1/plugin.wit) behavior remains available until plugins opt in. Domain-aware host calls carry owned inputs and replies. One logical task owns a Store unless a plugin explicitly supports partitioned state. A compact typed event snapshot usually avoids copying a large network payload into WIT; socket-to-WASM zero-copy is not part of this contract.
 
 ## Validation gate
 
+The gate tests semantic compatibility, bounded failure, and worker isolation together. A plugin timeout is meaningful only if a late reply cannot still alter authoritative state.
+
 | Test | Required result |
 | --- | --- |
-| v0.1 parity | Native and WASM handler order, returned event changes, cancellation, and client corrections match the declared legacy contract. |
-| Causal reentry | Same-region request, cross-domain call, opposing plugin roots, and `A → host → B → host → A` finish or fail by deadline without deadlock. |
-| Malicious guest | Infinite loop, excessive memory growth, and host-call flood yield/trap or are rejected within configured limits; no unbounded queue or core-worker occupation. |
-| Decision timeout | Placement/movement follow their documented fail policies; a late result cannot commit state or leak a pending transaction. |
-| Lifecycle | Unload, reload, shutdown, and cancellation drain or reject pending work deterministically. |
-| Performance | p99 plugin decision and host-call queue age are recorded. A stalled guest does not delay unrelated Tokio I/O or Rayon simulation beyond the phase 00 reference budget. Global-gate occupancy is visible. |
+| v0.1 parity | Native and WASM handler order, returned event changes, cancellation, and client corrections must match the declared legacy contract. |
+| Causal reentry | Same-region requests, cross-domain calls, opposing plugin roots, and `A → host → B → host → A` must finish or fail by deadline without deadlock. |
+| Malicious guest | Infinite loops, excessive memory growth, and host-call floods must yield, trap, or be rejected within configured limits. Queues and core-worker occupancy must remain bounded. |
+| Decision timeout | Placement and movement must follow their documented failure policies. A late result cannot commit state or leak a pending transaction. |
+| Lifecycle | Unload, reload, shutdown, and cancellation must drain or reject pending work deterministically. |
+| Performance | Record p99 plugin decision and host-call queue age and Global-gate occupancy. A stalled guest must not delay unrelated Tokio I/O or Rayon simulation beyond the phase 00 reference budget. |
 
-Only after these gates pass should the [region-ownership phase](03-region-ownership.md) route host commands to real spatial owners. A bounded decision wait remains part of cancellable plugin semantics; the guarantee is bounded isolation, not zero gameplay latency.
+Once these gates pass, the [region-ownership phase](03-region-ownership.md) can route host commands to spatial owners. Cancellable plugin semantics still include a bounded decision wait; the contract promises bounded isolation and explicit timeout behavior, rather than zero gameplay latency.
