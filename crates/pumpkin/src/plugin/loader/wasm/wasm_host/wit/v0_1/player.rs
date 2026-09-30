@@ -3590,6 +3590,9 @@ impl pumpkin::plugin::player::HostJavaPlayer for PluginHostState {
     ) -> wasmtime::Result<()> {
         let player = self.get(&player)?.clone();
 
+        if crate::net::java::pumpkin_mux::intercept_send(&player, &channel, &data).await {
+            return Ok(());
+        }
         if let crate::net::ClientPlatform::Java(_) = player.client.as_ref() {
             player
                 .send_client_packet(&pumpkin_protocol::java::client::play::CCustomPayload::new(

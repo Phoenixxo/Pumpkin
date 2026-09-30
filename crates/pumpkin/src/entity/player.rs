@@ -83,6 +83,9 @@ impl JavaPlayer<'_> {
     }
 
     pub async fn send_custom_payload(&self, channel: &str, data: &[u8]) {
+        if crate::net::java::pumpkin_mux::intercept_send(self.0, channel, data).await {
+            return;
+        }
         let packet = CCustomPayload::new(channel, data);
         self.send_packet(&packet).await;
     }

@@ -29,8 +29,9 @@ pub fn serialize_java_packet(
             Some(buf.into())
         }
         ClientboundPacket::ConfigCConfigDisconnect(data) => {
+            let component_reason = pumpkin_util::text::TextComponent::text(data.reason.clone());
             let p = pumpkin_protocol::java::client::config::CConfigDisconnect {
-                reason: &data.reason,
+                reason: &component_reason,
             };
             let mut buf = Vec::new();
             crate::net::java::JavaClient::write_packet_for_version(&p, version, &mut buf).unwrap();
@@ -1521,7 +1522,7 @@ impl ToWitClientboundJava for pumpkin_protocol::java::client::config::CCodeOfCon
 impl ToWitClientboundJava for pumpkin_protocol::java::client::config::CConfigDisconnect<'_> {
     fn to_wit(&self) -> ClientboundPacket {
         ClientboundPacket::ConfigCConfigDisconnect(crate::plugin::loader::wasm::wasm_host::wit::v0_1::pumpkin::plugin::java_packets::ConfigCConfigDisconnect {
-                reason: self.reason.to_string(),
+                reason: serde_json::to_string(&self.reason).unwrap_or_default(),
         })
     }
 }

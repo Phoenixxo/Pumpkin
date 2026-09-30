@@ -10,6 +10,17 @@ impl PendingConnection {
         self.connection_state.store(ConnectionState::Config);
         self.send_packet_now(&server.get_branding()).await;
 
+        let mux = &server.advanced_config.networking.pumpkin_mux;
+        if mux.enabled {
+            let hello = crate::net::java::pumpkin_mux::hello(mux).encode();
+            self.send_packet_now(&pumpkin_protocol::java::client::config::CPluginMessage::new(
+                crate::net::java::pumpkin_mux::CHANNEL,
+                &hello,
+            ))
+            .await;
+            self.mux_handshake = crate::net::java::pumpkin_mux::Handshake::HelloSent;
+        }
+
         if server.advanced_config.server_links.enabled {
             let mut links: Vec<Link> = Vec::new();
 

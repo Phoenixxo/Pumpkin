@@ -75,6 +75,8 @@ pub struct PendingConnection {
     pub packet_limiter: PacketRateLimiter,
     pub verify_token: Option<[u8; 4]>,
     pub vine_challenge: Option<[u8; 16]>,
+    /// Progress of the `pumpkin:mux` handshake.
+    pub mux_handshake: super::pumpkin_mux::Handshake,
     /// For the connection packet events.
     server: Weak<Server>,
 }
@@ -104,6 +106,7 @@ impl PendingConnection {
             packet_limiter,
             verify_token: None,
             vine_challenge: None,
+            mux_handshake: super::pumpkin_mux::Handshake::Off,
             server,
         }
     }
@@ -279,7 +282,7 @@ impl PendingConnection {
                 .await;
             }
             ConnectionState::Config => {
-                self.send_packet_now(&CConfigDisconnect::new(&reason.get_text()))
+                self.send_packet_now(&CConfigDisconnect::new(&reason))
                     .await;
             }
             ConnectionState::Play => {
@@ -499,8 +502,12 @@ impl PendingConnection {
                 Ok(None)
             }
             id if id == SPluginMessage::to_id(version) => {
-                self.handle_plugin_message(SPluginMessage::read(&mut payload, &version)?)
-                    .await;
+                let message = SPluginMessage::read(&mut payload, &version)?;
+                if message.channel == super::pumpkin_mux::CHANNEL {
+                    self.handle_mux_frame(server, message.data).await;
+                } else {
+                    self.handle_plugin_message(message).await;
+                }
                 Ok(None)
             }
             id if id == SAcknowledgeFinishConfig::to_id(version) => {
@@ -517,6 +524,12 @@ impl PendingConnection {
                 }
             }
             id if id == SKnownPacks::to_id(version) => {
+                // A Pumpkin Patch client answers HELLO from its network thread, so its REPLY
+                // arrives before this packet. No REPLY by now means a client without the mux.
+                if matches!(self.mux_handshake, super::pumpkin_mux::Handshake::HelloSent) {
+                    debug!("Client {} did not answer pumpkin:mux HELLO", self.id);
+                    self.mux_handshake = super::pumpkin_mux::Handshake::NonPumpkin;
+                }
                 self.handle_known_packs(server).await;
                 Ok(None)
             }
@@ -591,6 +604,44 @@ impl PendingConnection {
             match core::str::from_utf8(plugin_message.data) {
                 Ok(brand) => self.brand = Some(brand.to_string()),
                 Err(e) => self.kick(TextComponent::text(e.to_string())).await,
+            }
+        }
+    }
+
+    /// Handles a `pumpkin:mux` frame during configuration. Only `REPLY` is expected here.
+    pub async fn handle_mux_frame(&mut self, server: &Server, data: &[u8]) {
+        use super::pumpkin_mux::{Frame, Handshake, MalformedFrame, negotiate};
+        use pumpkin_protocol::java::client::config::CPluginMessage;
+
+        let mods = match Frame::decode(data) {
+            Ok(Frame::Reply { mods, .. }) => mods,
+            Ok(other) => {
+                warn!("Unexpected pumpkin:mux frame during configuration: {other:?}");
+                return;
+            }
+            Err(MalformedFrame(why)) => {
+                debug!("Dropping malformed pumpkin:mux frame from {}: {why}", self.id);
+                return;
+            }
+        };
+        if !matches!(self.mux_handshake, Handshake::HelloSent) {
+            warn!("Ignoring pumpkin:mux REPLY from {} outside the handshake", self.id);
+            return;
+        }
+        let negotiated = negotiate(&server.advanced_config.networking.pumpkin_mux, &mods);
+        let accept = negotiated.accept.encode();
+        self.send_packet_now(&CPluginMessage::new(super::pumpkin_mux::CHANNEL, &accept))
+            .await;
+        match negotiated.session {
+            Some(session) => {
+                debug!("pumpkin:mux routes for {}: {:?}", self.id, session.routes);
+                self.mux_handshake = Handshake::Joined(session);
+            }
+            None => {
+                let Frame::Accept { message, .. } = negotiated.accept else {
+                    return;
+                };
+                self.kick(TextComponent::text(message)).await;
             }
         }
     }
