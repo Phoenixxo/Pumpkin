@@ -57,6 +57,7 @@ pub mod login;
 mod outgoing;
 pub mod pending;
 pub mod play;
+pub mod pumpkin_mux;
 pub mod recipe_helper;
 pub mod status;
 
@@ -133,6 +134,8 @@ pub struct JavaClient {
     pub packet_limiter: PacketRateLimiter,
     /// Vanilla `suspendFlushingOnServerThread`.
     suspend_flushing: Arc<AtomicBool>,
+    /// Routes negotiated over `pumpkin:mux`, if this is a Pumpkin Patch client.
+    pub mux: std::sync::Mutex<Option<pumpkin_mux::MuxSession>>,
 }
 
 impl JavaClient {
@@ -171,6 +174,10 @@ impl JavaClient {
             packet_sequence: AtomicI32::new(-1),
             packet_limiter: pending.packet_limiter,
             suspend_flushing: Arc::new(AtomicBool::new(false)),
+            mux: std::sync::Mutex::new(match pending.mux_handshake {
+                pumpkin_mux::Handshake::Joined(session) => Some(session),
+                _ => None,
+            }),
         }
     }
 
@@ -530,8 +537,7 @@ impl JavaClient {
                 self.serialize_packet(&packet).ok()
             }
             ConnectionState::Config => {
-                let reason_text = reason.clone().get_text();
-                let packet = CConfigDisconnect::new(&reason_text);
+                let packet = CConfigDisconnect::new(reason);
                 self.serialize_packet(&packet).ok()
             }
             ConnectionState::Play => {
@@ -1053,6 +1059,10 @@ impl JavaClient {
             }
             id if id == SCustomPayload::to_id(version) => {
                 let payload = SCustomPayload::read(&mut payload, &version)?;
+                if payload.channel == pumpkin_mux::CHANNEL {
+                    pumpkin_mux::handle_play_frame(server, player, payload.data);
+                    return Ok(());
+                }
                 let channel_str = payload.channel.to_string();
                 let mut event = PlayerCustomPayloadEvent::new(
                     player.clone(),

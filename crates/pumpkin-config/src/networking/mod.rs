@@ -26,6 +26,9 @@ pub mod rcon;
 
 /// Packet limiter configuration.
 pub mod packet_limiter;
+/// Pumpkin Patch `pumpkin:mux` configuration.
+pub mod pumpkin_mux;
+pub use pumpkin_mux::{PumpkinMuxConfig, PumpkinMuxModConfig};
 pub use packet_limiter::PacketLimiterConfig;
 
 /// Configuration for server networking features.
@@ -47,4 +50,6 @@ pub struct NetworkingConfig {
     pub java: JavaConfig,
     /// Bedrock Edition configuration settings.
     pub bedrock: BedrockConfig,
+    /// Pumpkin Patch `pumpkin:mux` channel settings.
+    pub pumpkin_mux: PumpkinMuxConfig,
 }
