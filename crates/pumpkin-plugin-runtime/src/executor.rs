@@ -106,9 +106,16 @@ where
     }
 }
 
-struct GuestStoreCall<T, F, R> {
-    call: F,
-    result: oneshot::Sender<wasmtime::Result<R>>,
+/// The result of a guest call with its type erased, so one job type (and one copy of the code that
+/// runs it) serves every call site instead of one per closure and result type.
+type ErasedOutput = Box<dyn Any + Send>;
+
+type ErasedGuestCall<T> =
+    Box<dyn for<'a> FnOnce(LegacyGuestScope<'a, T>) -> StoreFuture<'a, ErasedOutput> + Send>;
+
+struct GuestStoreCall<T: 'static> {
+    call: ErasedGuestCall<T>,
+    result: oneshot::Sender<wasmtime::Result<ErasedOutput>>,
     context: ReentryContext,
     reentry: Arc<ReentryState<T>>,
     guest_call_failure: Arc<GuestCallFailure>,
@@ -130,11 +137,9 @@ impl GuestCallFailure {
     }
 }
 
-impl<T, F, R> GuestStoreJob<T> for GuestStoreCall<T, F, R>
+impl<T> GuestStoreJob<T> for GuestStoreCall<T>
 where
     T: Send + 'static,
-    F: for<'a> FnOnce(LegacyGuestScope<'a, T>) -> StoreFuture<'a, R> + Send + 'static,
-    R: Send + 'static,
 {
     fn run_concurrent(self: Box<Self>, accessor: &Accessor<T>) -> StoreFuture<'_, ()> {
         let Self {
@@ -605,6 +610,19 @@ where
         F: for<'a> FnOnce(LegacyGuestScope<'a, T>) -> StoreFuture<'a, R> + Send + 'static,
         R: Send + 'static,
     {
+        // Only this wrapper is generic over the closure and its result. The queueing, admission
+        // and reentry handling below is compiled once, not once per call site.
+        let call: ErasedGuestCall<T> = Box::new(move |scope| {
+            let future = call(scope);
+            Box::pin(async move { future.await.map(|output| Box::new(output) as ErasedOutput) })
+        });
+        let output = self.call_guest_erased(call).await?;
+        output.downcast::<R>().map(|output| *output).map_err(|_| {
+            wasmtime::Error::msg("Wasm plugin guest call returned an unexpected result type")
+        })
+    }
+
+    async fn call_guest_erased(&self, call: ErasedGuestCall<T>) -> wasmtime::Result<ErasedOutput> {
         if let Some(message) = self.shared.guest_call_failure.message() {
             return Err(wasmtime::Error::msg(format!(
                 "Wasm plugin store failed during a guest call: {message}"
