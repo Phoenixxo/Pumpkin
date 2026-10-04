@@ -64,53 +64,75 @@ jobs:
 
       - name: Build with memory sampling
         run: |
-          # System-wide memory in use, which is what the OOM killer reacts to. It is also printed to
-          # the log every 30 seconds so the last value survives a runner that gets killed.
+          # When the runner runs out of memory it can take the whole job down, so later steps never
+          # run and artifacts are never uploaded. Everything useful is therefore printed to the log
+          # from inside this step: the sampler writes a line every 10 seconds, new kernel OOM
+          # messages are printed as they appear, and a SIGTERM trap prints the summary on the way out.
           : > mem.log
+
+          oom_lines() {
+            sudo -n dmesg 2>/dev/null | grep -i -E "out of memory|oom-kill|killed process" || true
+          }
+
+          summary() {
+            end=$(date +%s)
+            total=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+            peak=$(sort -k1 -n mem.log | tail -1 | awk '{print $1}')
+            big=$(sort -k2 -n mem.log | tail -1 | awk '{print $2 " MB (" $3 ")"}')
+            {
+              echo "### ${{ matrix.name }} (${{ inputs.lto || 'fat' }} LTO)"
+              echo ""
+              echo "| | |"
+              echo "|:--|:--|"
+              echo "| result | $1 |"
+              echo "| build time | $((end - start))s |"
+              echo "| runner memory | ${total} MB |"
+              echo "| peak system memory in use | ${peak:-n/a} MB |"
+              echo "| largest single process (RSS) | ${big:-n/a} |"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "[oom] kernel messages:"
+            oom_lines | tail -20
+          }
+
           (
+            seen=0
             n=0
             while true; do
               used=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {print int((t-a)/1024)}' /proc/meminfo)
-              echo "$used" >> mem.log
+              top=$(ps -eo rss=,comm= --sort=-rss | head -1)
+              echo "$used $(echo "$top" | awk '{print int($1/1024), $2}')" >> mem.log
+              echo "[mem] used=${used}MB top=$(echo "$top" | awk '{print int($1/1024) "MB " $2}')"
               n=$((n + 1))
-              if [ $((n % 15)) -eq 0 ]; then echo "[mem] used=${used}MB"; fi
-              sleep 2
+              if [ $((n % 3)) -eq 0 ]; then
+                count=$(oom_lines | wc -l)
+                if [ "$count" -gt "$seen" ]; then
+                  echo "[oom] new kernel messages:"
+                  oom_lines | tail -"$((count - seen))"
+                  seen=$count
+                fi
+              fi
+              sleep 10
             done
           ) &
           SAMPLER=$!
 
           start=$(date +%s)
-          status=0
-          /usr/bin/time -v -o time.log cargo build --release --locked -p pumpkin --bin pumpkin || status=$?
-          end=$(date +%s)
-          kill "$SAMPLER" 2>/dev/null || true
+          trap 'kill "$SAMPLER" 2>/dev/null; summary "terminated by the runner (SIGTERM)"; exit 143' TERM INT
 
-          total=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-          peak=$(sort -n mem.log | tail -1)
-          maxrss=$(awk -F': ' '/Maximum resident set size/ {print int($2/1024)}' time.log)
-          {
-            echo "### ${{ matrix.name }} (${{ inputs.lto || 'fat' }} LTO)"
-            echo ""
-            echo "| | |"
-            echo "|:--|:--|"
-            echo "| exit code | $status |"
-            echo "| build time | $((end - start))s |"
-            echo "| runner memory | ${total} MB |"
-            echo "| peak system memory in use | ${peak} MB |"
-            echo "| largest single process (RSS) | ${maxrss:-n/a} MB |"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          status=0
+          cargo build --release --locked -p pumpkin --bin pumpkin || status=$?
+          kill "$SAMPLER" 2>/dev/null || true
+          summary "exit code $status"
           exit "$status"
 
       - name: Kernel OOM messages
         if: always()
-        run: sudo dmesg 2>/dev/null | grep -i -E "out of memory|killed process" | tail -20 || true
+        run: sudo -n dmesg 2>/dev/null | grep -i -E "out of memory|oom-kill|killed process" | tail -20 || true
 
       - name: Upload memory log
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: mem-${{ matrix.name }}
-          path: |
-            mem.log
-            time.log
+          path: mem.log
           if-no-files-found: ignore
