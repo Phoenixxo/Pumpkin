@@ -1,0 +1,116 @@
+name: LTO memory test
+
+# Builds the pumpkin binary with the release profile and records how much memory the runner uses,
+# so a build that gets killed still leaves numbers in the job log. Runs on pushes to the test
+# branch, or manually with other inputs.
+on:
+  push:
+    branches:
+      - test/arm-fat-lto-memory
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label to build on
+        required: false
+        default: ubuntu-26.04-arm
+        type: string
+      lto:
+        description: LTO mode (off, thin or fat)
+        required: false
+        default: fat
+        type: choice
+        options:
+          - fat
+          - thin
+          - "off"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_LTO: ${{ (inputs.lto || 'fat') == 'fat' && 'true' || inputs.lto }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04-arm' }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: master
+            repository: Pumpkin-MC/Pumpkin
+            ref: master
+          - name: this branch
+            repository: ${{ github.repository }}
+            ref: ${{ github.ref }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          submodules: recursive
+
+      - run: rustup update stable && rustup default stable
+
+      - name: Runner info
+        run: |
+          uname -m
+          nproc
+          free -m
+          rustc -Vv
+
+      - name: Build with memory sampling
+        run: |
+          # System-wide memory in use, which is what the OOM killer reacts to. It is also printed to
+          # the log every 30 seconds so the last value survives a runner that gets killed.
+          : > mem.log
+          (
+            n=0
+            while true; do
+              used=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {print int((t-a)/1024)}' /proc/meminfo)
+              echo "$used" >> mem.log
+              n=$((n + 1))
+              if [ $((n % 15)) -eq 0 ]; then echo "[mem] used=${used}MB"; fi
+              sleep 2
+            done
+          ) &
+          SAMPLER=$!
+
+          start=$(date +%s)
+          status=0
+          /usr/bin/time -v -o time.log cargo build --release --locked -p pumpkin --bin pumpkin || status=$?
+          end=$(date +%s)
+          kill "$SAMPLER" 2>/dev/null || true
+
+          total=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+          peak=$(sort -n mem.log | tail -1)
+          maxrss=$(awk -F': ' '/Maximum resident set size/ {print int($2/1024)}' time.log)
+          {
+            echo "### ${{ matrix.name }} (${{ inputs.lto || 'fat' }} LTO)"
+            echo ""
+            echo "| | |"
+            echo "|:--|:--|"
+            echo "| exit code | $status |"
+            echo "| build time | $((end - start))s |"
+            echo "| runner memory | ${total} MB |"
+            echo "| peak system memory in use | ${peak} MB |"
+            echo "| largest single process (RSS) | ${maxrss:-n/a} MB |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Kernel OOM messages
+        if: always()
+        run: sudo dmesg 2>/dev/null | grep -i -E "out of memory|killed process" | tail -20 || true
+
+      - name: Upload memory log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mem-${{ matrix.name }}
+          path: |
+            mem.log
+            time.log
+          if-no-files-found: ignore
