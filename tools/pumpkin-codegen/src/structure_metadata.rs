@@ -251,7 +251,7 @@ pub fn build() -> TokenStream {
     parsed_templates.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut constants = Vec::new();
-    let mut match_arms = Vec::new();
+    let mut lookup_entries = Vec::new();
     let mut all_names = Vec::new();
 
     for tmpl in &parsed_templates {
@@ -299,10 +299,10 @@ pub fn build() -> TokenStream {
             };
         });
 
-        match_arms.push(quote! {
-            #id_str | #full_id => Some(&Self::#const_ident),
+        lookup_entries.push(quote! {
+            #id_str => &StaticStructureMetadataList::#const_ident,
+            #full_id => &StaticStructureMetadataList::#const_ident,
         });
-
         all_names.push(full_id);
     }
 
@@ -330,6 +330,12 @@ pub fn build() -> TokenStream {
             pub placement_priority: i32,
         }
 
+        static STRUCTURE_METADATA_BY_NAME:
+            phf::Map<&'static str, &'static StaticStructureMetadata> =
+            phf::phf_map! {
+                #(#lookup_entries)*
+            };
+
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct StaticStructureMetadata {
             pub size: [i32; 3],
@@ -344,10 +350,7 @@ pub fn build() -> TokenStream {
             #[must_use]
             pub fn get(id: &str) -> Option<&'static StaticStructureMetadata> {
                 let trimmed = id.strip_prefix("minecraft:").unwrap_or(id);
-                match trimmed {
-                    #(#match_arms)*
-                    _ => None,
-                }
+                STRUCTURE_METADATA_BY_NAME.get(trimmed).copied()
             }
 
             #[must_use]
