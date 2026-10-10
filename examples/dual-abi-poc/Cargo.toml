@@ -1,0 +1,5 @@
+[workspace]
+members = ["guest-v01", "guest-v02", "host"]
+resolver = "2"
+[profile.release]
+opt-level = 1

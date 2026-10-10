@@ -1,0 +1,2 @@
+package demo:api@0.1.0;
+interface player { heal: func(amount: f32) -> f32; }

@@ -1,0 +1,9 @@
+package demo:plugins;
+world legacy {
+    import demo:api/player@0.1.0;
+    export run: func() -> f32;
+}
+world modern {
+    import demo:api/player@0.2.0;
+    export run: async func() -> f32;
+}
