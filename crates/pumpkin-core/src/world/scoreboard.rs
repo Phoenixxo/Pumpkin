@@ -592,7 +592,7 @@ impl Scoreboard {
             return;
         };
 
-        if !team.players.contains(&player.to_string()) {
+        if !team.players.iter().any(|member| member == player) {
             return;
         }
 

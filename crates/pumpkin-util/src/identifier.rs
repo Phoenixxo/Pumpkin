@@ -352,6 +352,14 @@ impl TryFrom<&str> for Identifier {
     type Error = IdentifierError;
 
     fn try_from(value: &str) -> IdentifierCreationResult {
+        value.parse()
+    }
+}
+
+impl std::str::FromStr for Identifier {
+    type Err = IdentifierError;
+
+    fn from_str(value: &str) -> IdentifierCreationResult {
         Self::parse(value)
     }
 }

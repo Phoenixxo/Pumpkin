@@ -445,6 +445,14 @@ impl TryFrom<&str> for NamedColor {
     type Error = ();
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl std::str::FromStr for NamedColor {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "black" => Ok(Self::Black),
             "dark_blue" => Ok(Self::DarkBlue),
