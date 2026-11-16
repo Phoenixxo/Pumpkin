@@ -12,6 +12,17 @@ on:
         required: false
         default: stable
         type: string
+      frontend_threads:
+        description: Compiler frontend threads (an explicit count requires nightly Rust)
+        required: false
+        default: default
+        type: choice
+        options:
+          - default
+          - "1"
+          - "2"
+          - "4"
+          - "8"
       release_lto:
         description: LTO mode for the release builds (off, thin or fat)
         required: false
@@ -34,7 +45,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CI_RUST_TOOLCHAIN_VER: ${{ inputs.rust_toolchain_version || 'stable' }}
-  RUSTFLAGS: "-Dwarnings"
+  RUSTUP_TOOLCHAIN: ${{ inputs.rust_toolchain_version || 'stable' }}
+  RUSTFLAGS: >-
+    -Dwarnings${{ inputs.frontend_threads && inputs.frontend_threads != 'default'
+    && format(' -Zunstable-options --jobs-frontend={0}', inputs.frontend_threads) || '' }}
 
 jobs:
   prepare:
